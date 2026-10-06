@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::blend::BlendMode;
 use crate::buf::{Mask, Pixmap};
 use crate::geom::IRect;
+use crate::text::TextSpec;
 
 pub type LayerId = u64;
 
@@ -38,6 +39,8 @@ pub struct Layer {
     pub pixels: Arc<Pixmap>,
     pub mask: Option<Arc<Mask>>,
     pub mask_enabled: bool,
+    /// Set while the pixels are still an untouched rendering of this text.
+    pub text: Option<Arc<TextSpec>>,
     /// Changes whenever the layer's rasters change; used to refresh thumbnails.
     pub rev: u64,
 }
@@ -56,6 +59,7 @@ impl Layer {
             pixels: Arc::new(pixels),
             mask: None,
             mask_enabled: true,
+            text: None,
             rev: next_id(),
         }
     }
@@ -145,6 +149,8 @@ enum Change {
 struct Step {
     name: String,
     change: Change,
+    /// Later commits with the same key fold into this step.
+    merge: Option<u64>,
 }
 
 impl Step {
@@ -230,7 +236,7 @@ impl Document {
 
     fn push(&mut self, name: &str, change: Change) {
         self.steps.truncate(self.pos);
-        self.steps.push(Step { name: name.to_owned(), change });
+        self.steps.push(Step { name: name.to_owned(), change, merge: None });
         let mut bytes: usize = self.steps.iter().map(Step::bytes).sum();
         let mut drop = self.steps.len().saturating_sub(MAX_STEPS);
         while bytes > MAX_PATCH_BYTES && drop < self.steps.len() - 1 {
@@ -254,6 +260,23 @@ impl Document {
         self.push(name, Change::State { before: Box::new(before), after: Box::new(self.state.clone()) });
     }
 
+    /// Like [`Self::commit`], but consecutive commits with the same `key` and
+    /// name become one undo step (typing, dragging a slider).
+    pub fn commit_merged(&mut self, name: &str, before: DocState, key: u64) {
+        self.mark_all_dirty();
+        if self.pos == self.steps.len() {
+            if let Some(Step { name: n, change: Change::State { after, .. }, merge: Some(k) }) = self.steps.last_mut() {
+                if *k == key && n == name {
+                    *after = Box::new(self.state.clone());
+                    self.modified = true;
+                    return;
+                }
+            }
+        }
+        self.push(name, Change::State { before: Box::new(before), after: Box::new(self.state.clone()) });
+        self.steps.last_mut().unwrap().merge = Some(key);
+    }
+
     /// Record a change confined to `rect` (buffer coordinates) of one raster of
     /// one layer. Falls back to a full-state step if the layer was reframed.
     pub fn commit_patch(&mut self, name: &str, before: DocState, layer: LayerId, target: Target, rect: IRect) {
@@ -262,7 +285,9 @@ impl Document {
             return;
         }
         let same_geom = match (before.layer(layer), self.state.layer(layer)) {
-            (Some(a), Some(b)) => a.rect() == b.rect() && (target == Target::Pixels || a.mask.is_some()),
+            (Some(a), Some(b)) => {
+                a.rect() == b.rect() && a.text.is_some() == b.text.is_some() && (target == Target::Pixels || a.mask.is_some())
+            }
             _ => false,
         };
         if !same_geom {

@@ -47,6 +47,21 @@ pub fn load_pixmap(path: &Path) -> Result<Pixmap> {
     Ok(Pixmap::from_raw(w, h, img.into_raw()))
 }
 
+/// Decode an image held in memory (any format [`load_pixmap`] reads).
+pub fn decode_image(bytes: &[u8]) -> Result<Pixmap> {
+    let img = image::load_from_memory(bytes)?.into_rgba8();
+    let (w, h) = img.dimensions();
+    Ok(Pixmap::from_raw(w, h, img.into_raw()))
+}
+
+/// Encode pixels as a PNG in memory.
+pub fn encode_png(p: &Pixmap) -> Result<Vec<u8>> {
+    let img = RgbaImage::from_raw(p.w, p.h, p.data.clone()).expect("buffer size");
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, ImageFormat::Png)?;
+    Ok(out.into_inner())
+}
+
 /// Open a document. Flat images become a single-layer document with no
 /// `path`, so saving asks where to put the `.ora`.
 pub fn open(path: &Path) -> Result<Document> {

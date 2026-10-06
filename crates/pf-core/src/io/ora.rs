@@ -16,6 +16,7 @@ use crate::blend::BlendMode;
 use crate::buf::{Mask, Pixmap};
 use crate::composite;
 use crate::document::{DocState, Layer};
+use crate::text::{Align, TextSpec};
 
 fn png_rgba(p: &Pixmap) -> Result<Vec<u8>> {
     let img = RgbaImage::from_raw(p.w, p.h, p.data.clone()).expect("buffer size");
@@ -32,7 +33,61 @@ fn png_gray(m: &Mask) -> Result<Vec<u8>> {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\n', "&#10;").replace('\t', "&#9;").replace('\r', "")
+}
+
+/// Attributes that keep a text layer editable. Other apps ignore them and
+/// just show the rendered pixels.
+fn text_attrs(t: &TextSpec) -> String {
+    let path: Vec<String> = t.path.iter().map(|p| format!("{},{}", p.0, p.1)).collect();
+    let c = t.color;
+    format!(
+        " pixelferrite-text=\"{}\" pixelferrite-text-font=\"{}\" pixelferrite-text-style=\"{}{}\" pixelferrite-text-size=\"{}\" pixelferrite-text-color=\"{:02x}{:02x}{:02x}{:02x}\" pixelferrite-text-align=\"{}\" pixelferrite-text-tracking=\"{}\" pixelferrite-text-leading=\"{}\" pixelferrite-text-path=\"{}\" pixelferrite-text-offset=\"{}\" pixelferrite-text-raster=\"{},{}\"",
+        esc(&t.text),
+        esc(&t.font),
+        if t.bold { "bold " } else { "" },
+        if t.italic { "italic" } else { "" },
+        t.size,
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        t.align.name(),
+        t.tracking,
+        t.leading,
+        path.join(" "),
+        t.path_offset,
+        t.raster.0,
+        t.raster.1,
+    )
+}
+
+fn parse_text(node: &roxmltree::Node<'_, '_>) -> Option<TextSpec> {
+    let attr = |k: &str| node.attribute(format!("pixelferrite-text{k}").as_str());
+    let num = |k: &str| attr(k).and_then(|v| v.parse::<f32>().ok());
+    let pair = |s: &str| {
+        let (a, b) = s.split_once(',')?;
+        Some((a.parse::<f32>().ok()?, b.parse::<f32>().ok()?))
+    };
+    let text = attr("")?.to_owned();
+    let style = attr("-style").unwrap_or("");
+    let hex = attr("-color").unwrap_or("000000ff");
+    let color: [u8; 4] = std::array::from_fn(|i| hex.get(i * 2..i * 2 + 2).and_then(|h| u8::from_str_radix(h, 16).ok()).unwrap_or(255));
+    let raster = attr("-raster").and_then(pair)?;
+    Some(TextSpec {
+        text,
+        font: attr("-font").unwrap_or("").to_owned(),
+        bold: style.contains("bold"),
+        italic: style.contains("italic"),
+        size: num("-size").unwrap_or(72.0),
+        color,
+        align: Align::from_name(attr("-align").unwrap_or("")),
+        tracking: num("-tracking").unwrap_or(0.0),
+        leading: num("-leading").unwrap_or(1.2),
+        path: attr("-path").unwrap_or("").split_whitespace().filter_map(pair).collect(),
+        path_offset: num("-offset").unwrap_or(0.0),
+        raster: (raster.0 as i32, raster.1 as i32),
+    })
 }
 
 pub fn save(state: &DocState, path: &Path) -> Result<()> {
@@ -60,6 +115,9 @@ pub fn save(state: &DocState, path: &Path) -> Result<()> {
             zip.start_file(&msrc, stored)?;
             zip.write_all(&png_gray(m)?)?;
             extra = format!(" pixelferrite-mask=\"{msrc}\" pixelferrite-mask-enabled=\"{}\"", l.mask_enabled);
+        }
+        if let Some(t) = &l.text {
+            extra += &text_attrs(t);
         }
         xml += &format!(
             "    <layer name=\"{}\" src=\"{src}\" x=\"{}\" y=\"{}\" opacity=\"{}\" visibility=\"{}\" composite-op=\"{}\" edit-locked=\"{}\"{}{extra}/>\n",
@@ -135,6 +193,7 @@ pub fn load(path: &Path) -> Result<DocState> {
                 l.mask_enabled = node.attribute("pixelferrite-mask-enabled") != Some("false");
             }
         }
+        l.text = parse_text(&node).map(Arc::new);
         if node.attribute("selected") == Some("true") {
             active = l.id;
         }

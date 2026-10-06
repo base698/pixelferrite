@@ -1,5 +1,7 @@
+mod ai;
 mod app;
 mod canvas;
+mod fonts;
 mod panels;
 mod tools;
 mod view;

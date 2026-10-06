@@ -49,6 +49,9 @@ impl GradientOp {
             return None;
         }
         layer.ensure_covers(canvas);
+        if target == Target::Pixels || layer.mask.is_none() {
+            layer.text = None;
+        }
         let off = (layer.x, layer.y);
         let area = sel.as_deref().and_then(selection::bounds).unwrap_or(canvas).intersect(canvas);
         Some(Self {
@@ -186,6 +189,7 @@ pub fn fill_mask(doc: &mut Document, name: &str, cov: &Mask, mode: FillMode, opa
             }
         }
         _ => {
+            layer.text = None;
             let px = Arc::make_mut(&mut layer.pixels);
             for y in rect.y0..rect.y1 {
                 for x in rect.x0..rect.x1 {

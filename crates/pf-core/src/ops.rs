@@ -127,6 +127,7 @@ impl Document {
         composite::composite_rect(&tmp, rect, &mut out.data);
         lower.pixels = Arc::new(out);
         lower.mask = None;
+        lower.text = None;
         lower.opacity = 1.0;
         lower.x = rect.x0;
         lower.y = rect.y0;
@@ -149,6 +150,7 @@ impl Document {
     pub fn flip_layer(&mut self, id: LayerId, horizontal: bool) {
         let before = self.begin();
         let Some(l) = self.state.layer_mut(id) else { return };
+        l.text = None;
         let px = Arc::make_mut(&mut l.pixels);
         if horizontal { px.flip_h() } else { px.flip_v() }
         if let Some(m) = &mut l.mask {
@@ -210,6 +212,7 @@ impl Document {
         let before = self.begin();
         let Some(l) = self.state.layer_mut(id) else { return };
         let Some(m) = l.mask.take() else { return };
+        l.text = None;
         let px = Arc::make_mut(&mut l.pixels);
         for (p, &m) in px.data.chunks_exact_mut(4).zip(&m.data) {
             p[3] = ((p[3] as u32 * m as u32 + 127) / 255) as u8;
@@ -327,9 +330,20 @@ impl Document {
 
     /// Topmost visible layer with a non-transparent pixel at a document point.
     pub fn layer_at(&self, x: i32, y: i32) -> Option<LayerId> {
-        self.state.layers.iter().rev().find_map(|l| {
-            let p = l.pixels.get(x - l.x, y - l.y)?;
-            (l.visible && p[3] > 8 && l.mask_at(x - l.x, y - l.y) > 8).then_some(l.id)
+        let solid = |l: &Layer, x: i32, y: i32| {
+            l.pixels.get(x - l.x, y - l.y).is_some_and(|p| p[3] > 8 && l.mask_at(x - l.x, y - l.y) > 8)
+        };
+        self.state.layers.iter().rev().filter(|l| l.visible).find_map(|l| {
+            let hit = match &l.text {
+                // Text is mostly gaps, so anywhere close to a letter counts.
+                Some(t) => {
+                    let r = (t.size * 0.5).clamp(4.0, 400.0) as i32;
+                    let step = (r / 4).max(1) as usize;
+                    (-r..=r).step_by(step).any(|dy| (-r..=r).step_by(step).any(|dx| solid(l, x + dx, y + dy)))
+                }
+                None => solid(l, x, y),
+            };
+            hit.then_some(l.id)
         })
     }
 }

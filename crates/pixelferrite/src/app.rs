@@ -2,10 +2,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use egui::{Color32, ColorImage, Context, Key, Modifiers, Pos2, TextureHandle, TextureOptions, ViewportCommand, vec2};
+use pf_core::aiedit::{self, AiJob};
+use pf_core::filter::{EdgeParams, EdgeStyle, Filter, FilterOp};
 use pf_core::ops::{Clip, Reorder};
+use pf_core::text::{FontRef, TextSpec};
 use pf_core::{DocState, Document, Layer, LayerId, io};
 
+use crate::ai;
 use crate::canvas::{self, Ants, Drag};
+use crate::fonts::Fonts;
 use crate::panels;
 use crate::tools::{Settings, Tool};
 use crate::view::{Display, View};
@@ -50,6 +55,30 @@ pub enum Action {
     ZoomFit,
     Zoom100,
     ResetRotation,
+    GaussianBlur,
+    EdgeDetect,
+    AiPrompt,
+}
+
+/// The "Send to AI" prompt dialog.
+pub struct AiPrompt {
+    text: String,
+    cfg: ai::Config,
+    focus: bool,
+}
+
+/// A request that is out with the model.
+pub struct AiRun {
+    rx: std::sync::mpsc::Receiver<Result<pf_core::Pixmap, String>>,
+    job: AiJob,
+    prompt: String,
+    started: f64,
+}
+
+/// A filter being previewed in its dialog.
+pub struct FilterDlg {
+    op: FilterOp,
+    filter: Filter,
 }
 
 pub struct Thumb {
@@ -88,6 +117,19 @@ pub struct App {
     pub prop: Option<(egui::Id, DocState)>,
     pub layer_drag: Option<(LayerId, usize)>,
     pub last_rotate: f64,
+    pub fonts: Fonts,
+    /// Undo merge key for the current run of text edits.
+    pub text_key: u64,
+    /// Put the keyboard in the text box (and select its contents) next frame.
+    pub text_focus: Option<bool>,
+    /// The next drag with the type tool redraws the active text's path.
+    pub text_repath: bool,
+    text_ctx: (Tool, LayerId),
+    pub filter: Option<FilterDlg>,
+    pub ai_prompt: Option<AiPrompt>,
+    pub ai_run: Option<AiRun>,
+    ai_error: Option<String>,
+    ai_last: String,
     title: String,
     now: f64,
 }
@@ -118,6 +160,16 @@ impl App {
             prop: None,
             layer_drag: None,
             last_rotate: 0.0,
+            fonts: Fonts::default(),
+            text_key: 0,
+            text_focus: None,
+            text_repath: false,
+            text_ctx: (Tool::Brush, 0),
+            filter: None,
+            ai_prompt: None,
+            ai_run: None,
+            ai_error: None,
+            ai_last: String::new(),
             title: String::new(),
             now: 0.0,
         };
@@ -153,6 +205,244 @@ impl App {
         self.clone_off = None;
         self.prop = None;
         self.rename = None;
+        self.filter = None;
+        self.ai_prompt = None;
+        // An answer for the old document has nowhere to go.
+        self.ai_run = None;
+    }
+
+    /// What "Send to AI" would send right now, in words.
+    fn ai_scope(&self) -> String {
+        let name = self.doc.state.active_layer().map_or("layer", |l| l.name.as_str());
+        match self.doc.state.selection {
+            Some(_) => format!("the selected part of \u{201c}{name}\u{201d}, with some of its surroundings for context. Only the selection is replaced"),
+            None => format!("all of \u{201c}{name}\u{201d}"),
+        }
+    }
+
+    fn open_ai_prompt(&mut self) {
+        if self.ai_run.is_some() {
+            return self.toast("The AI is still working on the last request");
+        }
+        if aiedit::prepare(&self.doc.state, |w, h| (w.min(16), h.min(16))).is_none() {
+            return self.toast("Nothing to send: the selection doesn't touch this layer");
+        }
+        self.ai_prompt = Some(AiPrompt { text: self.ai_last.clone(), cfg: ai::Config::load(), focus: true });
+    }
+
+    pub fn send_to_ai(&mut self, ctx: &Context, prompt: String, cfg: ai::Config) {
+        let model = cfg.model.clone();
+        let Some(job) = aiedit::prepare(&self.doc.state, |w, h| ai::request_size(&model, w, h)) else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (image, mask, text, ctx2) = (job.image.clone(), job.mask.clone(), prompt.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(ai::edit(&cfg, &text, &image, mask.as_ref()));
+            ctx2.request_repaint();
+        });
+        self.ai_last = prompt.clone();
+        self.ai_run = Some(AiRun { rx, job, prompt, started: self.now });
+    }
+
+    fn ai_dialogs(&mut self, ctx: &Context) {
+        // The prompt.
+        let scope = self.ai_scope();
+        if let Some(p) = &mut self.ai_prompt {
+            let (mut send, mut close) = (false, false);
+            egui::Modal::new(egui::Id::new("ai-prompt")).show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.heading("Send to AI");
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("Sends {scope}. The result comes back as a new layer.")).weak());
+                ui.add_space(6.0);
+                let edit = egui::TextEdit::multiline(&mut p.text)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("What should change? e.g. \u{201c}remove the dog\u{201d} or \u{201c}make this look like Rome\u{201d}");
+                let r = ui.add(edit);
+                if std::mem::take(&mut p.focus) {
+                    r.request_focus();
+                }
+                ui.add_space(4.0);
+                match &p.cfg.key {
+                    Some(_) => {
+                        ui.label(egui::RichText::new(format!("The image is uploaded to OpenAI ({}) and usually takes up to a minute.", p.cfg.model)).small().weak());
+                    }
+                    None => {
+                        ui.colored_label(Color32::from_rgb(255, 170, 90), "No OpenAI key found.");
+                        let first = ai::env_files().first().map(|f| f.display().to_string()).unwrap_or_default();
+                        ui.label(egui::RichText::new(format!("Add a line OPENAI_API_KEY=sk-... to {first} and open this dialog again.")).small());
+                    }
+                }
+                ui.add_space(10.0);
+                let ready = p.cfg.key.is_some() && !p.text.trim().is_empty();
+                ui.allocate_ui_with_layout(vec2(420.0, 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let cmd_enter = ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
+                    send = (ui.add_enabled(ready, egui::Button::new("Send")).on_hover_text("\u{2318}/Ctrl + Enter").clicked() || cmd_enter) && ready;
+                    close = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
+                });
+            });
+            if send {
+                let p = self.ai_prompt.take().unwrap();
+                self.send_to_ai(ctx, p.text.trim().to_owned(), p.cfg);
+            } else if close {
+                self.ai_last = self.ai_prompt.take().unwrap().text;
+            }
+        }
+
+        // The answer.
+        if let Some(run) = &self.ai_run {
+            match run.rx.try_recv() {
+                Ok(Ok(px)) => {
+                    let run = self.ai_run.take().unwrap();
+                    let short: String = run.prompt.chars().take(28).collect();
+                    canvas::cancel(self);
+                    self.doc.insert_ai_result(&run.job, &px, &format!("AI: {short}"));
+                    self.toast("AI result added as a new layer");
+                }
+                Ok(Err(e)) => {
+                    self.ai_run = None;
+                    self.ai_error = Some(e);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.ai_run = None;
+                    self.ai_error = Some("The request stopped unexpectedly.".to_owned());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    let secs = (self.now - run.started) as u32;
+                    let mut cancel = false;
+                    egui::Area::new(egui::Id::new("ai-status")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -64.0]).order(egui::Order::Foreground).show(ctx, |ui| {
+                        egui::Frame::new().fill(Color32::from_black_alpha(225)).corner_radius(8).inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(egui::RichText::new(format!("AI is working\u{2026} {secs} s")).color(Color32::WHITE));
+                                cancel = ui.small_button("Cancel").clicked();
+                            });
+                        });
+                    });
+                    if cancel {
+                        self.ai_run = None;
+                        self.toast("AI request cancelled");
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+
+        if let Some(e) = &self.ai_error {
+            let mut ok = false;
+            egui::Modal::new(egui::Id::new("ai-error")).show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.heading("The AI edit didn't work");
+                ui.add_space(6.0);
+                ui.label(e);
+                ui.add_space(10.0);
+                ui.allocate_ui_with_layout(vec2(420.0, 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ok = ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape));
+                });
+            });
+            if ok {
+                self.ai_error = None;
+            }
+        }
+    }
+
+    /// Re-render a text layer from `spec`. Edits made in a row to the same
+    /// layer are a single undo step.
+    pub fn apply_text(&mut self, id: LayerId, spec: TextSpec) {
+        let (data, index) = self.fonts.face(&spec.font, spec.bold, spec.italic);
+        let Ok(font) = FontRef::try_from_slice_and_index(&data, index) else { return };
+        let before = self.doc.begin();
+        if self.doc.update_text(id, spec, &font) {
+            self.doc.commit_merged("Edit Text", before, self.text_key);
+        }
+    }
+
+    /// Add a text layer at `origin` (document space), following `path` if it
+    /// isn't empty, and start editing it.
+    pub fn new_text(&mut self, origin: Pos2, path: Vec<(f32, f32)>) {
+        let spec = TextSpec { text: "Text".to_owned(), path, path_offset: 0.0, ..self.settings.text.clone() };
+        let (data, index) = self.fonts.face(&spec.font, spec.bold, spec.italic);
+        let Ok(font) = FontRef::try_from_slice_and_index(&data, index) else { return };
+        self.doc.add_text_layer(spec, (origin.x.round() as i32, origin.y.round() as i32), &font);
+        self.text_focus = Some(true);
+    }
+
+    fn open_filter(&mut self, filter: Filter) {
+        match FilterOp::begin(&self.doc) {
+            Some(mut op) => {
+                op.update(&mut self.doc, &filter);
+                self.filter = Some(FilterDlg { op, filter });
+            }
+            None => self.toast("This layer is hidden or locked"),
+        }
+    }
+
+    fn filter_dialog(&mut self, ctx: &Context) {
+        let Some(d) = &mut self.filter else { return };
+        let (mut apply, mut cancel, mut changed, mut select) = (false, false, false, false);
+        egui::Window::new(d.filter.name())
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(self.view.vp.left_bottom() + vec2(16.0, -150.0))
+            .show(ctx, |ui| {
+                ui.set_width(250.0);
+                ui.spacing_mut().slider_width = 170.0;
+                match &mut d.filter {
+                    Filter::GaussianBlur { radius } => {
+                        ui.label("Radius");
+                        let s = egui::Slider::new(radius, 0.1..=250.0).logarithmic(true).suffix(" px").max_decimals(1);
+                        changed |= ui.add(s).changed();
+                    }
+                    Filter::EdgeDetect(p) => {
+                        ui.horizontal(|ui| {
+                            for (s, label) in [(EdgeStyle::Lines, "Lines"), (EdgeStyle::LinesOnBlack, "On black"), (EdgeStyle::Highlight, "Highlight")] {
+                                changed |= ui.selectable_value(&mut p.style, s, label).changed();
+                            }
+                            if p.style == EdgeStyle::Highlight {
+                                let mut c = Color32::from_rgba_unmultiplied(p.color[0], p.color[1], p.color[2], p.color[3]);
+                                if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
+                                    p.color = [c.r(), c.g(), c.b(), 255];
+                                    changed = true;
+                                }
+                            }
+                        });
+                        ui.label("Threshold").on_hover_text("Lower finds more edges");
+                        changed |= ui.add(egui::Slider::new(&mut p.threshold, 2.0..=200.0).logarithmic(true).max_decimals(0)).changed();
+                        ui.label("Smoothing").on_hover_text("Higher ignores fine texture");
+                        changed |= ui.add(egui::Slider::new(&mut p.smoothing, 0.0..=8.0).suffix(" px").max_decimals(1)).changed();
+                        ui.label("Line width");
+                        changed |= ui.add(egui::Slider::new(&mut p.thickness, 1.0..=15.0).suffix(" px").max_decimals(0)).changed();
+                        if ui.button("Select Edges Instead").on_hover_text("Leave the pixels alone and select the detected edges").clicked() {
+                            select = true;
+                        }
+                    }
+                }
+                let scope = if self.doc.state.selection.is_some() { "the selection on" } else { "all of" };
+                let what = if self.doc.effective_target() == pf_core::Target::Mask { "mask" } else { "layer" };
+                ui.label(egui::RichText::new(format!("Applies to {scope} the active {what}.")).small().weak());
+                ui.add_space(8.0);
+                ui.allocate_ui_with_layout(vec2(250.0, 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    apply = ui.button("Apply").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if !ctx.egui_wants_keyboard_input() {
+            apply |= ctx.input(|i| i.key_pressed(Key::Enter));
+            cancel |= ctx.input(|i| i.key_pressed(Key::Escape));
+        }
+        if select {
+            let d = self.filter.take().unwrap();
+            if let Filter::EdgeDetect(p) = &d.filter {
+                d.op.select_edges(&mut self.doc, p);
+            }
+        } else if cancel {
+            self.filter.take().unwrap().op.cancel(&mut self.doc);
+        } else if apply {
+            let d = self.filter.take().unwrap();
+            d.op.finish(&mut self.doc, &d.filter);
+        } else if changed {
+            d.op.update(&mut self.doc, &d.filter);
+        }
     }
 
     /// Ask before throwing away unsaved work. True means go ahead.
@@ -223,6 +513,11 @@ impl App {
 
     pub fn run(&mut self, ctx: &Context, a: Action) {
         if !matches!(self.drag, Drag::None) {
+            return;
+        }
+        // While a filter is being previewed only the view may change.
+        let view = matches!(a, Action::ZoomIn | Action::ZoomOut | Action::ZoomFit | Action::Zoom100 | Action::ResetRotation);
+        if self.filter.is_some() && !view {
             return;
         }
         let active = self.doc.state.active;
@@ -304,6 +599,9 @@ impl App {
                 let (c, r) = (self.view.vp.center(), self.view.rot);
                 self.view.rotate_about(c, -r);
             }
+            Action::GaussianBlur => self.open_filter(Filter::GaussianBlur { radius: 8.0 }),
+            Action::EdgeDetect => self.open_filter(Filter::EdgeDetect(EdgeParams::default())),
+            Action::AiPrompt => self.open_ai_prompt(),
         }
     }
 
@@ -311,6 +609,10 @@ impl App {
         const CMD: Modifiers = Modifiers::COMMAND;
         let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         let cmd_alt = Modifiers::COMMAND | Modifiers::ALT;
+        // A focused text field gets its own select-all, undo and so on.
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
         // Longer chords first: `consume_key` ignores extra Shift/Alt.
         let table: [(Modifiers, Key, Action); 24] = [
             (cmd_shift, Key::Z, Action::Redo),
@@ -343,7 +645,7 @@ impl App {
                 self.run(ctx, a);
             }
         }
-        if ctx.egui_wants_keyboard_input() {
+        if self.filter.is_some() {
             return;
         }
         let events = ctx.input(|i| i.events.clone());
@@ -481,8 +783,15 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.now = ctx.input(|i| i.time);
 
-        if self.new_doc.is_none() {
+        if self.new_doc.is_none() && self.ai_prompt.is_none() && self.ai_error.is_none() {
             self.shortcuts(&ctx);
+        }
+        // Switching tool or layer ends the current run of text edits.
+        let text_ctx = (self.tool, self.doc.state.active);
+        if text_ctx != self.text_ctx {
+            self.text_ctx = text_ctx;
+            self.text_key = pf_core::document::next_id();
+            self.text_repath = false;
         }
 
         // Files dropped on the window become new layers.
@@ -543,6 +852,8 @@ impl eframe::App for App {
         }
 
         self.new_doc_dialog(&ctx);
+        self.filter_dialog(&ctx);
+        self.ai_dialogs(&ctx);
 
         if let Some((msg, until)) = &self.toast {
             if self.now < *until {

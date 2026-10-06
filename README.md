@@ -23,8 +23,52 @@ app with synthetic pointer input and writes rendered frames to `target/uitest/`.
 
 The native format is [OpenRaster](https://www.openraster.org/) (`.ora`), which
 Krita, GIMP and MyPaint also open. Layer masks are stored as extra PNGs inside
-the archive that other apps ignore. Export writes PNG, JPEG or GIF. Undo
-history lives in memory for the session and is not written to the file.
+the archive that other apps ignore, and text layers carry their text, font and
+path as extra attributes so they stay editable (other apps see the rendered
+pixels). Export writes PNG, JPEG or GIF. Undo history lives in memory for the
+session and is not written to the file.
+
+## Text
+
+With the type tool (T), click to place text or drag to draw a path that new
+text follows. Click existing text to edit it; its options are in the inspector.
+"Redraw Path" gives existing text a new path and "Straighten" removes it.
+Painting on a text layer, or filtering it, turns it into ordinary pixels.
+
+## Filters
+
+Filters live in the Filter menu and preview on the canvas until you press
+Apply. They affect the active layer (or its mask when that is being edited),
+limited to the selection if there is one. To add one, add a variant to
+`Filter` in `crates/pf-core/src/filter.rs` and its controls to
+`App::filter_dialog`.
+
+- **Gaussian Blur**
+- **Edge Detection** — Canny edge detection (the same algorithm as OpenCV's
+  `Canny`, implemented here so there is no native library to install). Draws
+  the edges as lines on white or black, or highlights them over the image;
+  "Select Edges Instead" turns them into a selection.
+
+## AI edits
+
+Layer > "Send to AI with Prompt…" (also in a layer's right-click menu) asks
+for a prompt and sends the active layer to OpenAI's image model; the answer
+comes back as a new layer above it. With a selection, only the selected area
+(plus some surroundings for context) is sent, and only the selection is
+replaced, scaled to fit.
+
+Put the key in a `.env` file in the directory you run from (or any parent, or
+`~/.config/pixelferrite/.env`):
+
+```
+OPENAI_API_KEY=sk-...
+# optional
+OPENAI_IMAGE_MODEL=gpt-image-2
+OPENAI_IMAGE_QUALITY=medium
+```
+
+`.env` is git-ignored. `cargo test -p pixelferrite -- --ignored live_edit`
+sends one small real request to check the key and model.
 
 ## Controls
 
@@ -41,4 +85,4 @@ history lives in memory for the session and is not written to the file.
 
 Tool keys: V arrange, M / O / L rectangle, ellipse and free selection, Q quick
 selection, W magic wand, B brush, N pencil, E eraser, G gradient, K fill,
-S clone stamp, R smudge, I color picker, H hand, Z zoom.
+S clone stamp, R smudge, T type, I color picker, H hand, Z zoom.

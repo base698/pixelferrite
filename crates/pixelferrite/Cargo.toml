@@ -4,11 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.23.1"
 eframe = "0.36.2"
 egui = "0.36.2"
 egui-phosphor = "0.14.0"
+epaint_default_fonts = "0.36.2"
+fontdb = "0.24.0"
 pf-core = { version = "0.1.0", path = "../pf-core" }
 rfd = "0.17.2"
+serde_json = "1.0.151"
+ureq = "3.4.2"
 
 [dev-dependencies]
 egui_kittest = { version = "0.36.2", features = ["wgpu", "eframe"] }

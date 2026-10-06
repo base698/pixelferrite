@@ -3,6 +3,7 @@ use egui_phosphor::regular as icon;
 use pf_core::fill::GradientShape;
 use pf_core::paint::BrushParams;
 use pf_core::selection::Combine;
+use pf_core::text::TextSpec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tool {
@@ -19,6 +20,7 @@ pub enum Tool {
     Clone,
     Gradient,
     Bucket,
+    Text,
     Eyedropper,
     Hand,
     Zoom,
@@ -26,7 +28,7 @@ pub enum Tool {
 
 impl Tool {
     /// Toolbar order; `None` is a gap between groups.
-    pub const STRIP: [Option<Tool>; 20] = [
+    pub const STRIP: [Option<Tool>; 22] = [
         Some(Tool::Move),
         None,
         Some(Tool::RectSelect),
@@ -43,6 +45,8 @@ impl Tool {
         None,
         Some(Tool::Clone),
         Some(Tool::Smudge),
+        None,
+        Some(Tool::Text),
         None,
         Some(Tool::Eyedropper),
         Some(Tool::Hand),
@@ -64,6 +68,7 @@ impl Tool {
             Tool::Clone => "Clone Stamp",
             Tool::Gradient => "Gradient",
             Tool::Bucket => "Color Fill",
+            Tool::Text => "Type",
             Tool::Eyedropper => "Color Picker",
             Tool::Hand => "Hand",
             Tool::Zoom => "Zoom",
@@ -85,6 +90,7 @@ impl Tool {
             Tool::Clone => icon::STAMP,
             Tool::Gradient => icon::GRADIENT,
             Tool::Bucket => icon::PAINT_BUCKET,
+            Tool::Text => icon::TEXT_T,
             Tool::Eyedropper => icon::EYEDROPPER,
             Tool::Hand => icon::HAND,
             Tool::Zoom => icon::MAGNIFYING_GLASS,
@@ -106,6 +112,7 @@ impl Tool {
             Tool::Clone => Key::S,
             Tool::Gradient => Key::G,
             Tool::Bucket => Key::K,
+            Tool::Text => Key::T,
             Tool::Eyedropper => Key::I,
             Tool::Hand => Key::H,
             Tool::Zoom => Key::Z,
@@ -137,6 +144,8 @@ pub struct Settings {
     pub gradient_fill: GradientFill,
     pub gradient_opacity: f32,
     pub sel_mode: Combine,
+    /// Style for new text; `text` and `path` are ignored.
+    pub text: TextSpec,
     pub tolerance: u8,
     pub contiguous: bool,
     pub sample_all_layers: bool,
@@ -161,6 +170,7 @@ impl Default for Settings {
             gradient_fill: GradientFill::ForegroundToBackground,
             gradient_opacity: 1.0,
             sel_mode: Combine::Replace,
+            text: TextSpec::default(),
             tolerance: 32,
             contiguous: true,
             sample_all_layers: true,

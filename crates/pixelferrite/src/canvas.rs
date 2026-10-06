@@ -6,6 +6,7 @@ use egui::{Color32, CursorIcon, Mesh, Modifiers, PointerButton, Pos2, Rect, Sens
 use pf_core::fill::{self, GradientOp, GradientParams};
 use pf_core::paint::{PaintKind, Stroke};
 use pf_core::selection::{self, Combine};
+use pf_core::text;
 use pf_core::{DocState, IRect, Pixmap, composite};
 
 use crate::app::App;
@@ -24,6 +25,8 @@ pub enum Drag {
     Marquee { start: Pos2, cur: Pos2, mode: Combine, ellipse: bool },
     Lasso { pts: Vec<Pos2>, mode: Combine },
     Quick { before: DocState, src: Pixmap, mode: Combine, last: Pos2 },
+    /// Type tool: a click places text, a drag draws a path for it.
+    TextPath { pts: Vec<Pos2> },
 }
 
 /// Cached selection outline, rebuilt when the selection mask changes.
@@ -117,7 +120,7 @@ pub fn canvas(app: &mut App, ui: &mut Ui) {
     if matches!(app.drag, Drag::None) && on_canvas {
         if inp.mid_pressed || (inp.pressed && (inp.space || app.tool == Tool::Hand)) {
             app.drag = Drag::Pan;
-        } else if inp.pressed {
+        } else if inp.pressed && app.filter.is_none() {
             if let Some(p) = inp.pos {
                 press(app, app.view.to_doc(p), inp.mods);
             }
@@ -173,6 +176,20 @@ pub fn canvas(app: &mut App, ui: &mut Ui) {
         }
     }
 
+    // The path (or baseline start) of the text being edited.
+    if app.tool == Tool::Text {
+        if let Some((l, t, (ox, oy))) = app.doc.state.active_layer().and_then(|l| Some((l, l.text.as_ref()?, l.text_origin()?))) {
+            let at = |p: (f32, f32)| app.view.to_screen(pos2(ox as f32 + p.0, oy as f32 + p.1));
+            let r = l.rect();
+            let r = Rect::from_min_max(pos2(r.x0 as f32, r.y0 as f32), pos2(r.x1 as f32, r.y1 as f32));
+            painter.add(Shape::closed_line(quad(r, &app.view), Line::new(1.0, ACCENT.gamma_multiply(0.45))));
+            if t.path.len() >= 2 {
+                painter.add(Shape::line(t.path.iter().map(|p| at(*p)).collect(), Line::new(1.0, ACCENT)));
+            }
+            painter.circle(at(t.path.first().copied().unwrap_or((0.0, 0.0))), 3.5, Color32::WHITE, Line::new(1.5, ACCENT));
+        }
+    }
+
     // In-progress shapes.
     let contrast = |painter: &egui::Painter, pts: Vec<Pos2>, closed: bool| {
         for (wd, col) in [(2.5, Color32::from_black_alpha(160)), (1.0, Color32::WHITE)] {
@@ -195,7 +212,7 @@ pub fn canvas(app: &mut App, ui: &mut Ui) {
             };
             contrast(&painter, pts, true);
         }
-        Drag::Lasso { pts, .. } => {
+        Drag::Lasso { pts, .. } | Drag::TextPath { pts } => {
             contrast(&painter, pts.iter().map(|p| app.view.to_screen(*p)).collect(), false);
         }
         Drag::Gradient { start, end, .. } => {
@@ -231,6 +248,7 @@ pub fn canvas(app: &mut App, ui: &mut Ui) {
         let mut icon = match app.tool {
             _ if panning => if inp.down || inp.mid_down { CursorIcon::Grabbing } else { CursorIcon::Grab },
             Tool::Move => CursorIcon::Move,
+            Tool::Text => CursorIcon::Text,
             Tool::Zoom => if inp.mods.alt { CursorIcon::ZoomOut } else { CursorIcon::ZoomIn },
             _ => CursorIcon::Crosshair,
         };
@@ -364,6 +382,7 @@ fn press(app: &mut App, p: Pos2, mods: Modifiers) {
             app.drag = Drag::Marquee { start: p, cur: p, mode: combine_mode(mods, app.settings.sel_mode), ellipse: tool == Tool::EllipseSelect };
         }
         Tool::Lasso => app.drag = Drag::Lasso { pts: vec![p], mode: combine_mode(mods, app.settings.sel_mode) },
+        Tool::Text => app.drag = Drag::TextPath { pts: vec![p] },
         Tool::MagicWand => {
             let s = &app.settings;
             let seed = ipos(p);
@@ -438,6 +457,11 @@ fn dragged(app: &mut App, p: Pos2, screen: Pos2, inp: &Input) {
                 pts.push(p);
             }
         }
+        Drag::TextPath { pts } => {
+            if pts.last() != Some(&p) {
+                pts.push(p);
+            }
+        }
         Drag::Quick { last, .. } => {
             if (*last - p).length() >= (app.settings.quick_size * 0.25).max(1.0) {
                 *last = p;
@@ -496,6 +520,37 @@ fn release(app: &mut App) {
             }
             let pts: Vec<(f32, f32)> = pts.iter().map(|p| (p.x, p.y)).collect();
             app.doc.select("Free Selection", &selection::polygon_mask(w, h, &pts), mode);
+        }
+        Drag::TextPath { pts } => {
+            let len: f32 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+            let repath = std::mem::take(&mut app.text_repath);
+            if len * app.view.scale() < 6.0 {
+                // A click edits the text under the pointer, or starts new text there.
+                let (x, y) = ipos(pts[0]);
+                let hit = app.doc.state.layers.iter().rev().find(|l| l.visible && l.text.is_some() && l.rect().contains(x, y));
+                match hit.map(|l| l.id) {
+                    Some(id) => {
+                        app.doc.state.active = id;
+                        app.doc.target = pf_core::Target::Pixels;
+                        app.text_focus = Some(false);
+                    }
+                    None => app.new_text(pts[0], Vec::new()),
+                }
+                return;
+            }
+            let raw: Vec<(f32, f32)> = pts.iter().map(|p| (p.x, p.y)).collect();
+            let path = text::smooth_path(&raw, 2.5 / app.view.scale());
+            let active = app.doc.state.active_layer().and_then(|l| Some((l.id, l.text.clone()?, l.text_origin()?)));
+            match active {
+                Some((id, spec, (ox, oy))) if repath => {
+                    let rel = path.iter().map(|p| (p.0 - ox as f32, p.1 - oy as f32)).collect();
+                    app.apply_text(id, text::TextSpec { path: rel, path_offset: 0.0, ..(*spec).clone() });
+                }
+                _ => {
+                    let o = pos2(path[0].0.round(), path[0].1.round());
+                    app.new_text(o, path.iter().map(|p| (p.0 - o.x, p.1 - o.y)).collect());
+                }
+            }
         }
         Drag::Quick { before, mode, .. } => {
             if mode == Combine::Intersect {

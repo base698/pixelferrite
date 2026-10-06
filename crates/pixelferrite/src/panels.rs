@@ -5,6 +5,7 @@ use egui_phosphor::regular as icon;
 use pf_core::fill::GradientShape;
 use pf_core::ops::Reorder;
 use pf_core::selection::Combine;
+use pf_core::text::{Align as TextAlign, TextSpec};
 use pf_core::{BlendMode, LayerId, Target};
 
 use crate::app::{Action, App};
@@ -78,11 +79,17 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
             ui.separator();
             item(app, ui, "Merge Down", &cmd("E"), Action::MergeDown);
             item(app, ui, "Flatten Image", "", Action::Flatten);
+            ui.separator();
+            item(app, ui, "Send to AI with Prompt…", "", Action::AiPrompt);
         });
         ui.menu_button("Select", |ui| {
             item(app, ui, "All", &cmd("A"), Action::SelectAll);
             item(app, ui, "Deselect", &cmd("D"), Action::Deselect);
             item(app, ui, "Invert", &cmd("⇧I"), Action::InvertSelection);
+        });
+        ui.menu_button("Filter", |ui| {
+            item(app, ui, "Gaussian Blur…", "", Action::GaussianBlur);
+            item(app, ui, "Edge Detection…", "", Action::EdgeDetect);
         });
         ui.menu_button("View", |ui| {
             item(app, ui, "Zoom In", &cmd("+"), Action::ZoomIn);
@@ -151,6 +158,9 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
 }
 
 pub fn tool_strip(app: &mut App, ui: &mut Ui) {
+    if app.filter.is_some() {
+        ui.disable();
+    }
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
         for t in Tool::STRIP {
@@ -214,7 +224,121 @@ fn wide_button(ui: &mut Ui, text: &str, w: f32) -> egui::Response {
     ui.add_sized([w, 22.0], egui::Button::new(text))
 }
 
+/// Options for the type tool. They edit the active text layer, or the style
+/// for the next new text when another kind of layer is active.
+fn text_options(app: &mut App, ui: &mut Ui, full: f32) {
+    let active = app.doc.state.active_layer().and_then(|l| Some((l.id, (**l.text.as_ref()?).clone())));
+    let orig = active.as_ref().map_or_else(|| app.settings.text.clone(), |(_, s)| s.clone());
+    let mut spec = orig.clone();
+
+    if active.is_some() {
+        let out = egui::TextEdit::multiline(&mut spec.text).desired_rows(3).desired_width(full).hint_text("Type here").show(ui);
+        if let Some(select_all) = app.text_focus.take() {
+            out.response.request_focus();
+            if select_all {
+                let mut state = out.state;
+                let end = egui::text::CCursor::new(spec.text.chars().count());
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), end)));
+                state.store(ui.ctx(), out.response.id);
+            }
+        }
+    } else {
+        app.text_focus = None;
+        ui.label(RichText::new("Click the image to add text, or drag to draw a path for the text to follow.").color(DIM));
+    }
+
+    section(ui, "Font");
+    let shown = if spec.font.is_empty() { "Built-in (Ubuntu Light)" } else { spec.font.as_str() }.to_owned();
+    egui::ComboBox::from_id_salt("font").selected_text(shown).width(full).height(360.0).show_ui(ui, |ui| {
+        if ui.selectable_label(spec.font.is_empty(), "Built-in (Ubuntu Light)").clicked() {
+            spec.font.clear();
+        }
+        let n = app.fonts.families().len();
+        let row = ui.text_style_height(&egui::TextStyle::Button) + ui.spacing().button_padding.y * 2.0;
+        let (first, last) = {
+            // Only lay out the rows in view: there can be hundreds of fonts.
+            let top = ui.clip_rect().top() - ui.cursor().top();
+            let step = row + ui.spacing().item_spacing.y;
+            let first = ((top / step).floor().max(0.0) as usize).min(n);
+            (first, (first + (ui.clip_rect().height() / step) as usize + 2).min(n))
+        };
+        let step = row + ui.spacing().item_spacing.y;
+        ui.add_space(first as f32 * step);
+        for i in first..last {
+            let name = &app.fonts.families()[i];
+            if ui.selectable_label(spec.font == *name, name).clicked() {
+                spec.font = name.clone();
+            }
+        }
+        ui.add_space((n - last) as f32 * step);
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let toggle = |ui: &mut Ui, on: &mut bool, glyph: &str, tip: &str| {
+            let b = egui::Button::new(RichText::new(glyph).size(16.0)).selected(*on);
+            if ui.add_sized([30.0, 26.0], b).on_hover_text(tip).clicked() {
+                *on = !*on;
+            }
+        };
+        toggle(ui, &mut spec.bold, icon::TEXT_B, "Bold");
+        toggle(ui, &mut spec.italic, icon::TEXT_ITALIC, "Italic");
+        ui.add_space(8.0);
+        for (a, glyph, tip) in [
+            (TextAlign::Left, icon::TEXT_ALIGN_LEFT, "Align left"),
+            (TextAlign::Center, icon::TEXT_ALIGN_CENTER, "Align center"),
+            (TextAlign::Right, icon::TEXT_ALIGN_RIGHT, "Align right"),
+        ] {
+            let b = egui::Button::new(RichText::new(glyph).size(16.0)).selected(spec.align == a);
+            if ui.add_sized([30.0, 26.0], b).on_hover_text(tip).clicked() {
+                spec.align = a;
+            }
+        }
+        ui.add_space(8.0);
+        let mut col = c32(spec.color);
+        if egui::color_picker::color_edit_button_srgba(ui, &mut col, egui::color_picker::Alpha::OnlyBlend).on_hover_text("Text color").changed() {
+            spec.color = col.to_srgba_unmultiplied();
+        }
+    });
+    size_slider(ui, &mut spec.size, 1000.0);
+    ui.label(RichText::new("Letter spacing").color(DIM));
+    ui.add(egui::Slider::new(&mut spec.tracking, -20.0..=200.0).suffix(" px").max_decimals(1));
+    if spec.path.len() < 2 {
+        ui.label(RichText::new("Line spacing").color(DIM));
+        ui.add(egui::Slider::new(&mut spec.leading, 0.5..=3.0).max_decimals(2));
+    }
+
+    if active.is_some() {
+        section(ui, "Path");
+        if spec.path.len() >= 2 {
+            let len: f32 = spec.path.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum();
+            ui.label(RichText::new("Position along path").color(DIM));
+            ui.add(egui::Slider::new(&mut spec.path_offset, -len..=len).suffix(" px").max_decimals(0));
+        }
+        let label = if spec.path.len() >= 2 { "Redraw Path" } else { "Draw a Path to Follow" };
+        if ui.add_sized([full, 22.0], egui::Button::new(label).selected(app.text_repath)).clicked() {
+            app.text_repath = !app.text_repath;
+        }
+        if app.text_repath {
+            ui.label(RichText::new("Now drag across the image along the line the text should follow.").color(DIM).small());
+        }
+        if spec.path.len() >= 2 && wide_button(ui, "Straighten", full).clicked() {
+            spec.path.clear();
+            spec.path_offset = 0.0;
+        }
+    }
+
+    if spec != orig {
+        app.settings.text = TextSpec { text: String::new(), path: Vec::new(), path_offset: 0.0, raster: (0, 0), ..spec.clone() };
+        if let Some((id, _)) = active {
+            app.apply_text(id, spec);
+        }
+    }
+}
+
 pub fn inspector(app: &mut App, ui: &mut Ui) {
+    if app.filter.is_some() {
+        ui.disable();
+    }
     let ctx = ui.ctx().clone();
     let snap = app.doc.begin();
     let tool = app.tool;
@@ -225,7 +349,7 @@ pub fn inspector(app: &mut App, ui: &mut Ui) {
     let half = (full - 8.0) / 2.0;
     ui.spacing_mut().slider_width = full - 62.0;
 
-    if tool != Tool::Move && tool != Tool::Hand && tool != Tool::Zoom && !tool.is_selection() {
+    if !matches!(tool, Tool::Move | Tool::Hand | Tool::Zoom | Tool::Text) && !tool.is_selection() {
         colors(app, ui);
         if app.doc.effective_target() == Target::Mask && tool != Tool::Eyedropper {
             ui.label(RichText::new("Editing the layer mask: dark hides, light reveals.").color(DIM).small());
@@ -368,6 +492,7 @@ pub fn inspector(app: &mut App, ui: &mut Ui) {
         Tool::Eyedropper => {
             ui.label(RichText::new("Click the image to pick the foreground color.").color(DIM));
         }
+        Tool::Text => text_options(app, ui, full),
         Tool::Hand => {
             ui.label(RichText::new("Drag to pan. Hold Space with any tool to pan temporarily.").color(DIM));
         }
@@ -449,6 +574,9 @@ enum RowAct {
 }
 
 pub fn layers(app: &mut App, ui: &mut Ui) {
+    if app.filter.is_some() {
+        ui.disable();
+    }
     let ctx = ui.ctx().clone();
     let snap = app.doc.begin();
 
@@ -577,7 +705,7 @@ pub fn layers(app: &mut App, ui: &mut Ui) {
             p.text(
                 pos2(text_x, rect.top() + 30.0),
                 Align2::LEFT_TOP,
-                format!("{} × {} px{lock}", layer.pixels.w, layer.pixels.h),
+                if layer.text.is_some() { format!("{}  Text{lock}", icon::TEXT_T) } else { format!("{} × {} px{lock}", layer.pixels.w, layer.pixels.h) },
                 FontId::proportional(11.0),
                 DIM,
             );
@@ -636,6 +764,8 @@ pub fn layers(app: &mut App, ui: &mut Ui) {
                 ui.separator();
                 m(ui, "Bring to Front", Action::Reorder(Reorder::Front));
                 m(ui, "Send to Back", Action::Reorder(Reorder::Back));
+                ui.separator();
+                m(ui, "Send to AI with Prompt…", Action::AiPrompt);
             });
         }
     });

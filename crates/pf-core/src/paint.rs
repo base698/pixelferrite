@@ -83,6 +83,9 @@ impl Stroke {
             return None;
         }
         layer.ensure_covers(canvas);
+        if target == Target::Pixels {
+            layer.text = None;
+        }
         let off = (layer.x, layer.y);
         let n = layer.pixels.w as usize * layer.pixels.h as usize;
         let mut s = Stroke {
