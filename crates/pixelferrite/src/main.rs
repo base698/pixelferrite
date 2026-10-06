@@ -1,8 +1,10 @@
 mod ai;
+mod aiui;
 mod app;
 mod canvas;
 mod fonts;
 mod panels;
+mod store;
 mod tools;
 mod view;
 

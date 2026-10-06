@@ -272,12 +272,12 @@ fn edge_detection_and_ai_edit() {
     drag(&mut h, &[c + vec2(-250.0, -150.0), c, c + vec2(-60.0, 40.0)]);
     h.state_mut().run(&ctx, Action::AiPrompt);
     h.run_steps(3);
-    assert!(h.state().ai_prompt.is_some());
+    assert!(h.state().ai.prompt_open());
     h.event(Event::Text("remove the red circle".into()));
     h.run_steps(2);
     h.render().unwrap().save(out.join("ai-prompt.png")).unwrap();
     key(&mut h, egui::Key::Escape);
-    assert!(h.state().ai_prompt.is_none());
+    assert!(!h.state().ai.prompt_open());
 
     // Sending: a stand-in server answers with solid green; it arrives as a
     // new layer that only covers the selection.
@@ -300,14 +300,14 @@ fn edge_detection_and_ai_edit() {
         let json = format!("{{\"data\":[{{\"b64_json\":\"{}\"}}]}}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png));
         write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}", json.len()).unwrap();
     });
-    let cfg = crate::ai::Config { key: Some("sk-test".into()), model: "gpt-image-2".into(), base, quality: None };
+    let cfg = crate::ai::Config { key: Some("sk-test".into()), model: "gpt-image-2".into(), base, quality: None, key_source: "a test".into() };
     let layers = h.state().doc.state.layers.len();
     h.state_mut().send_to_ai(&ctx, "remove the red circle".into(), cfg);
-    assert!(h.state().ai_run.is_some());
+    assert!(h.state().ai.running());
     h.run_steps(2);
     h.render().unwrap().save(out.join("ai-working.png")).unwrap();
     for _ in 0..200 {
-        if h.state().ai_run.is_none() {
+        if !h.state().ai.running() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
@@ -324,4 +324,57 @@ fn edge_detection_and_ai_edit() {
     assert_eq!(pf_core::composite::sample(st, sel.x0 - 40, mid.1), Some(before.px(sel.x0 - 40, mid.1)), "outside the selection is unchanged");
     h.run_steps(2);
     h.render().unwrap().save(out.join("ai-result.png")).unwrap();
+
+    // The request was recorded with what was sent and what came back.
+    let store = h.state().store.clone();
+    let recs = store.ai_records();
+    assert_eq!(recs.len(), 1);
+    let r = &recs[0];
+    assert_eq!((r.status.as_str(), r.prompt.as_str(), r.layer.as_str(), r.selection), ("done", "remove the red circle", "Background", true));
+    assert_eq!([r.region[2] - r.region[0], r.region[3] - r.region[1]].map(|v| v > 300), [true, true]);
+    for f in ["request.json", "input.png", "mask.png", "output.png"] {
+        assert!(store.ai_path(&r.id).join(f).exists(), "{f} should be saved");
+    }
+    let sent = io::load_pixmap(&store.ai_path(&r.id).join("input.png")).unwrap();
+    assert_eq!([sent.w, sent.h], r.size);
+    assert!(sent.data.chunks_exact(4).any(|p| p[0] > 200 && p[1] < 90), "the red circle should be in what was sent");
+    h.state_mut().run(&ctx, Action::AiHistory);
+    h.run_steps(4);
+    h.render().unwrap().save(out.join("ai-history.png")).unwrap();
+    h.state_mut().run(&ctx, Action::AiHistory);
+
+    // Settings save to the config file and come back.
+    h.state_mut().run(&ctx, Action::Settings);
+    h.run_steps(3);
+    h.render().unwrap().save(out.join("settings.png")).unwrap();
+    key(&mut h, egui::Key::Escape);
+    let mut s = h.state().saved.clone();
+    s.ai.quality = "low".into();
+    store.save_settings(&s).unwrap();
+    assert_eq!(store.load_settings().0.ai.quality, "low");
+
+    // Inserting an image into the selection fills it and takes its shape.
+    let photo = out.join("insert.png");
+    io::export(&Document::from_pixmap(Pixmap::filled(300, 100, [250, 200, 0, 255]), "p").state, &photo).unwrap();
+    h.state_mut().tool = Tool::EllipseSelect;
+    drag(&mut h, &[c + vec2(60.0, -60.0), c + vec2(150.0, 60.0), c + vec2(300.0, 200.0)]);
+    let n = h.state().doc.state.layers.len();
+    h.state_mut().insert_in_selection(&photo);
+    let st = &h.state().doc.state;
+    let sel = pf_core::selection::bounds(st.selection.as_ref().unwrap()).unwrap();
+    let new = st.layers.last().unwrap();
+    assert_eq!((st.layers.len(), new.rect(), new.name.as_str()), (n + 1, sel, "insert"));
+    assert_eq!(new.pixels.px(sel.width() / 2, sel.height() / 2), [250, 200, 0, 255]);
+    assert_eq!(new.pixels.px(1, 1)[3], 0, "corners outside the ellipse stay clear");
+    h.run_steps(2);
+    h.render().unwrap().save(out.join("insert.png.render.png")).unwrap();
+
+    // Opened files show up under Open Recent, newest first.
+    assert!(store.recent().is_empty());
+    h.state_mut().open_path(&photo);
+    h.state_mut().open_path(&out.join("input.png"));
+    let recent = store.recent();
+    assert_eq!(recent.iter().map(|f| f.path.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["input.png", "insert.png"]);
+    h.state_mut().open_path(&out.join("does-not-exist.png"));
+    assert_eq!(store.recent().len(), 2);
 }

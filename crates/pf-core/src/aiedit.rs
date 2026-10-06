@@ -26,7 +26,7 @@ pub struct AiJob {
     clip: Option<Mask>,
 }
 
-fn resize(p: &Pixmap, w: u32, h: u32, f: FilterType) -> Pixmap {
+pub(crate) fn resize(p: &Pixmap, w: u32, h: u32, f: FilterType) -> Pixmap {
     if (p.w, p.h) == (w, h) {
         return p.clone();
     }

@@ -44,11 +44,32 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
         ui.menu_button("File", |ui| {
             item(app, ui, "New…", &cmd("N"), Action::New);
             item(app, ui, "Open…", &cmd("O"), Action::Open);
-            item(app, ui, "Add Image as Layer…", &cmd("⇧O"), Action::AddImage);
+            ui.menu_button("Open Recent", |ui| {
+                let recent = app.store.recent();
+                if recent.is_empty() {
+                    ui.label(RichText::new("No recent files").color(DIM));
+                }
+                for f in &recent {
+                    let name = f.path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_owned();
+                    let dir = f.path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                    if ui.button(name).on_hover_text(format!("{dir}\nOpened {}", f.opened.replace('T', " ").trim_end_matches('Z'))).clicked() {
+                        app.open_recent(&f.path);
+                        ui.close();
+                    }
+                }
+                if !recent.is_empty() {
+                    ui.separator();
+                    item(app, ui, "Clear List", "", Action::ClearRecent);
+                }
+            });
+            item(app, ui, "Insert Image as New Layer…", &cmd("⇧O"), Action::AddImage);
+            item(app, ui, "Insert Image into Selection…", "", Action::InsertInSelection);
             ui.separator();
             item(app, ui, "Save", &cmd("S"), Action::Save);
             item(app, ui, "Save As…", &cmd("⇧S"), Action::SaveAs);
             item(app, ui, "Export PNG / JPEG / GIF…", &cmd("⇧E"), Action::Export);
+            ui.separator();
+            item(app, ui, "Settings…", "", Action::Settings);
         });
         ui.menu_button("Edit", |ui| {
             item(app, ui, "Undo", &cmd("Z"), Action::Undo);
@@ -81,6 +102,7 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
             item(app, ui, "Flatten Image", "", Action::Flatten);
             ui.separator();
             item(app, ui, "Send to AI with Prompt…", "", Action::AiPrompt);
+            item(app, ui, "AI Requests…", "", Action::AiHistory);
         });
         ui.menu_button("Select", |ui| {
             item(app, ui, "All", &cmd("A"), Action::SelectAll);

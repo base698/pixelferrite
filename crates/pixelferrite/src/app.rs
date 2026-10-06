@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use egui::{Color32, ColorImage, Context, Key, Modifiers, Pos2, TextureHandle, TextureOptions, ViewportCommand, vec2};
-use pf_core::aiedit::{self, AiJob};
 use pf_core::filter::{EdgeParams, EdgeStyle, Filter, FilterOp};
 use pf_core::ops::{Clip, Reorder};
 use pf_core::text::{FontRef, TextSpec};
 use pf_core::{DocState, Document, Layer, LayerId, io};
 
-use crate::ai;
+use crate::aiui::AiUi;
 use crate::canvas::{self, Ants, Drag};
 use crate::fonts::Fonts;
+use crate::store::{Settings as Saved, Store};
 use crate::panels;
 use crate::tools::{Settings, Tool};
 use crate::view::{Display, View};
@@ -24,6 +24,7 @@ pub enum Action {
     New,
     Open,
     AddImage,
+    InsertInSelection,
     Save,
     SaveAs,
     Export,
@@ -58,21 +59,9 @@ pub enum Action {
     GaussianBlur,
     EdgeDetect,
     AiPrompt,
-}
-
-/// The "Send to AI" prompt dialog.
-pub struct AiPrompt {
-    text: String,
-    cfg: ai::Config,
-    focus: bool,
-}
-
-/// A request that is out with the model.
-pub struct AiRun {
-    rx: std::sync::mpsc::Receiver<Result<pf_core::Pixmap, String>>,
-    job: AiJob,
-    prompt: String,
-    started: f64,
+    AiHistory,
+    Settings,
+    ClearRecent,
 }
 
 /// A filter being previewed in its dialog.
@@ -126,17 +115,28 @@ pub struct App {
     pub text_repath: bool,
     text_ctx: (Tool, LayerId),
     pub filter: Option<FilterDlg>,
-    pub ai_prompt: Option<AiPrompt>,
-    pub ai_run: Option<AiRun>,
-    ai_error: Option<String>,
-    ai_last: String,
+    pub ai: AiUi,
+    pub ctx: Context,
+    pub store: Store,
+    opened: Option<PathBuf>,
+    pub saved: Saved,
     title: String,
-    now: f64,
+    pub now: f64,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
         setup_style(&cc.egui_ctx);
+        // Tests get a throwaway folder so they never touch real settings.
+        #[cfg(test)]
+        let store = {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Store::at(&std::env::temp_dir().join(format!("pf-app-{}-{n}", std::process::id())))
+        };
+        #[cfg(not(test))]
+        let store = Store::standard();
+        let (saved, settings_error) = store.load_settings();
         let mut app = Self {
             doc: Document::new(1600, 1200, Some([255; 4])),
             view: View::new(),
@@ -166,13 +166,17 @@ impl App {
             text_repath: false,
             text_ctx: (Tool::Brush, 0),
             filter: None,
-            ai_prompt: None,
-            ai_run: None,
-            ai_error: None,
-            ai_last: String::new(),
+            ai: AiUi::default(),
+            ctx: cc.egui_ctx.clone(),
+            store: store.clone(),
+            opened: None,
+            saved,
             title: String::new(),
             now: 0.0,
         };
+        if let Some(e) = settings_error {
+            app.toast(format!("Couldn't read settings, using defaults. {e}"));
+        }
         if let Some(f) = file {
             app.open_path(&f);
         }
@@ -197,6 +201,7 @@ impl App {
 
     fn set_doc(&mut self, doc: Document) {
         canvas::cancel(self);
+        self.opened = None;
         self.doc = doc;
         self.doc.mark_all_dirty();
         self.thumbs.clear();
@@ -206,144 +211,7 @@ impl App {
         self.prop = None;
         self.rename = None;
         self.filter = None;
-        self.ai_prompt = None;
-        // An answer for the old document has nowhere to go.
-        self.ai_run = None;
-    }
-
-    /// What "Send to AI" would send right now, in words.
-    fn ai_scope(&self) -> String {
-        let name = self.doc.state.active_layer().map_or("layer", |l| l.name.as_str());
-        match self.doc.state.selection {
-            Some(_) => format!("the selected part of \u{201c}{name}\u{201d}, with some of its surroundings for context. Only the selection is replaced"),
-            None => format!("all of \u{201c}{name}\u{201d}"),
-        }
-    }
-
-    fn open_ai_prompt(&mut self) {
-        if self.ai_run.is_some() {
-            return self.toast("The AI is still working on the last request");
-        }
-        if aiedit::prepare(&self.doc.state, |w, h| (w.min(16), h.min(16))).is_none() {
-            return self.toast("Nothing to send: the selection doesn't touch this layer");
-        }
-        self.ai_prompt = Some(AiPrompt { text: self.ai_last.clone(), cfg: ai::Config::load(), focus: true });
-    }
-
-    pub fn send_to_ai(&mut self, ctx: &Context, prompt: String, cfg: ai::Config) {
-        let model = cfg.model.clone();
-        let Some(job) = aiedit::prepare(&self.doc.state, |w, h| ai::request_size(&model, w, h)) else { return };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (image, mask, text, ctx2) = (job.image.clone(), job.mask.clone(), prompt.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send(ai::edit(&cfg, &text, &image, mask.as_ref()));
-            ctx2.request_repaint();
-        });
-        self.ai_last = prompt.clone();
-        self.ai_run = Some(AiRun { rx, job, prompt, started: self.now });
-    }
-
-    fn ai_dialogs(&mut self, ctx: &Context) {
-        // The prompt.
-        let scope = self.ai_scope();
-        if let Some(p) = &mut self.ai_prompt {
-            let (mut send, mut close) = (false, false);
-            egui::Modal::new(egui::Id::new("ai-prompt")).show(ctx, |ui| {
-                ui.set_width(420.0);
-                ui.heading("Send to AI");
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(format!("Sends {scope}. The result comes back as a new layer.")).weak());
-                ui.add_space(6.0);
-                let edit = egui::TextEdit::multiline(&mut p.text)
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("What should change? e.g. \u{201c}remove the dog\u{201d} or \u{201c}make this look like Rome\u{201d}");
-                let r = ui.add(edit);
-                if std::mem::take(&mut p.focus) {
-                    r.request_focus();
-                }
-                ui.add_space(4.0);
-                match &p.cfg.key {
-                    Some(_) => {
-                        ui.label(egui::RichText::new(format!("The image is uploaded to OpenAI ({}) and usually takes up to a minute.", p.cfg.model)).small().weak());
-                    }
-                    None => {
-                        ui.colored_label(Color32::from_rgb(255, 170, 90), "No OpenAI key found.");
-                        let first = ai::env_files().first().map(|f| f.display().to_string()).unwrap_or_default();
-                        ui.label(egui::RichText::new(format!("Add a line OPENAI_API_KEY=sk-... to {first} and open this dialog again.")).small());
-                    }
-                }
-                ui.add_space(10.0);
-                let ready = p.cfg.key.is_some() && !p.text.trim().is_empty();
-                ui.allocate_ui_with_layout(vec2(420.0, 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let cmd_enter = ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
-                    send = (ui.add_enabled(ready, egui::Button::new("Send")).on_hover_text("\u{2318}/Ctrl + Enter").clicked() || cmd_enter) && ready;
-                    close = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
-                });
-            });
-            if send {
-                let p = self.ai_prompt.take().unwrap();
-                self.send_to_ai(ctx, p.text.trim().to_owned(), p.cfg);
-            } else if close {
-                self.ai_last = self.ai_prompt.take().unwrap().text;
-            }
-        }
-
-        // The answer.
-        if let Some(run) = &self.ai_run {
-            match run.rx.try_recv() {
-                Ok(Ok(px)) => {
-                    let run = self.ai_run.take().unwrap();
-                    let short: String = run.prompt.chars().take(28).collect();
-                    canvas::cancel(self);
-                    self.doc.insert_ai_result(&run.job, &px, &format!("AI: {short}"));
-                    self.toast("AI result added as a new layer");
-                }
-                Ok(Err(e)) => {
-                    self.ai_run = None;
-                    self.ai_error = Some(e);
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.ai_run = None;
-                    self.ai_error = Some("The request stopped unexpectedly.".to_owned());
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    let secs = (self.now - run.started) as u32;
-                    let mut cancel = false;
-                    egui::Area::new(egui::Id::new("ai-status")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -64.0]).order(egui::Order::Foreground).show(ctx, |ui| {
-                        egui::Frame::new().fill(Color32::from_black_alpha(225)).corner_radius(8).inner_margin(egui::Margin::symmetric(14, 8)).show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(egui::RichText::new(format!("AI is working\u{2026} {secs} s")).color(Color32::WHITE));
-                                cancel = ui.small_button("Cancel").clicked();
-                            });
-                        });
-                    });
-                    if cancel {
-                        self.ai_run = None;
-                        self.toast("AI request cancelled");
-                    }
-                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
-                }
-            }
-        }
-
-        if let Some(e) = &self.ai_error {
-            let mut ok = false;
-            egui::Modal::new(egui::Id::new("ai-error")).show(ctx, |ui| {
-                ui.set_width(420.0);
-                ui.heading("The AI edit didn't work");
-                ui.add_space(6.0);
-                ui.label(e);
-                ui.add_space(10.0);
-                ui.allocate_ui_with_layout(vec2(420.0, 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ok = ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape));
-                });
-            });
-            if ok {
-                self.ai_error = None;
-            }
-        }
+        self.ai.document_changed();
     }
 
     /// Re-render a text layer from `spec`. Edits made in a row to the same
@@ -461,7 +329,42 @@ impl App {
 
     pub fn open_path(&mut self, path: &Path) {
         match io::open(path) {
-            Ok(doc) => self.set_doc(doc),
+            Ok(doc) => {
+                self.set_doc(doc);
+                self.opened = Some(path.to_owned());
+                self.store.add_recent(path);
+            }
+            Err(e) => {
+                self.toast(format!("Couldn't open {}: {e}", path.display()));
+                if !path.exists() {
+                    self.store.remove_recent(path);
+                }
+            }
+        }
+    }
+
+    /// Open a file from the recent list, after the usual unsaved-changes check.
+    pub fn open_recent(&mut self, path: &Path) {
+        if matches!(self.drag, Drag::None) && self.filter.is_none() && self.confirm_discard() {
+            self.open_path(path);
+        }
+    }
+
+    /// The file this image came from, if any (also set for flat images,
+    /// which have no save path).
+    pub fn source_file(&self) -> Option<&Path> {
+        self.doc.path.as_deref().or(self.opened.as_deref())
+    }
+
+    /// Insert an image file so it fills the selection, cut to its shape.
+    pub fn insert_in_selection(&mut self, path: &Path) {
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Layer").to_owned();
+        match io::load_pixmap(path) {
+            Ok(px) => {
+                if self.doc.add_image_in_selection(&name, &px).is_none() {
+                    self.toast("Select the area the image should fill first");
+                }
+            }
             Err(e) => self.toast(format!("Couldn't open {}: {e}", path.display())),
         }
     }
@@ -487,7 +390,10 @@ impl App {
         };
         let Some(path) = path else { return };
         match io::save(&mut self.doc, &path) {
-            Ok(()) => self.toast(format!("Saved {}", path.display())),
+            Ok(()) => {
+                self.store.add_recent(&path);
+                self.toast(format!("Saved {}", path.display()))
+            }
             Err(e) => self.toast(format!("Save failed: {e}")),
         }
     }
@@ -534,6 +440,15 @@ impl App {
                 let exts: Vec<&str> = io::OPEN_EXTENSIONS.iter().copied().filter(|e| *e != "ora").collect();
                 for p in rfd::FileDialog::new().add_filter("Images", &exts).pick_files().unwrap_or_default() {
                     self.add_image(&p);
+                }
+            }
+            Action::InsertInSelection => {
+                if self.doc.state.selection.is_none() {
+                    return self.toast("Select the area the image should fill first");
+                }
+                let exts: Vec<&str> = io::OPEN_EXTENSIONS.iter().copied().filter(|e| *e != "ora").collect();
+                if let Some(p) = rfd::FileDialog::new().add_filter("Images", &exts).pick_file() {
+                    self.insert_in_selection(&p);
                 }
             }
             Action::Save => self.save(false),
@@ -602,6 +517,9 @@ impl App {
             Action::GaussianBlur => self.open_filter(Filter::GaussianBlur { radius: 8.0 }),
             Action::EdgeDetect => self.open_filter(Filter::EdgeDetect(EdgeParams::default())),
             Action::AiPrompt => self.open_ai_prompt(),
+            Action::AiHistory => self.open_ai_history(),
+            Action::Settings => self.open_settings(),
+            Action::ClearRecent => self.store.clear_recent(),
         }
     }
 
@@ -783,7 +701,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.now = ctx.input(|i| i.time);
 
-        if self.new_doc.is_none() && self.ai_prompt.is_none() && self.ai_error.is_none() {
+        if self.new_doc.is_none() && !self.ai.modal_open() {
             self.shortcuts(&ctx);
         }
         // Switching tool or layer ends the current run of text edits.

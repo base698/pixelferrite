@@ -57,8 +57,13 @@ comes back as a new layer above it. With a selection, only the selected area
 (plus some surroundings for context) is sent, and only the selection is
 replaced, scaled to fit.
 
-Put the key in a `.env` file in the directory you run from (or any parent, or
-`~/.config/pixelferrite/.env`):
+The prompt dialog shows exactly what will be sent. Every request is kept, with
+the image that was sent, the mask and the answer: Layer > "AI Requests…" lists
+them and can add an old result back as a layer or reuse its prompt.
+
+Set the key in File > Settings, or in a `.env` file in the directory you run
+from (or any parent). Each setting is taken from `.env` first, then the
+settings file, then the shell environment:
 
 ```
 OPENAI_API_KEY=sk-...
@@ -67,9 +72,40 @@ OPENAI_IMAGE_MODEL=gpt-image-2
 OPENAI_IMAGE_QUALITY=medium
 ```
 
-`.env` is git-ignored. `cargo test -p pixelferrite -- --ignored live_edit`
-sends one small real request to check the key and model.
+`.env` is git-ignored. `cargo test -p pixelferrite -- --ignored live` sends two
+small real requests to check the key and model.
 
+## Inserting images
+
+File > "Insert Image as New Layer…" adds an image centred on the canvas (so
+does dropping a file on the window). "Insert Image into Selection…" scales
+it to fill the selection, keeping its proportions, and cuts it to the
+selection's shape, as a new layer.
+
+## Saved data
+
+```
+~/.config/pixelferrite/            ($XDG_CONFIG_HOME)
+  config.toml                      settings; owner-readable only, holds the AI key
+~/.local/share/pixelferrite/       ($XDG_DATA_HOME)
+  recent.json                      File > Open Recent
+  ai/<date>-<time>-<id>/           one folder per AI request
+    request.json                   prompt, model, size, layer, area, status, timing, usage
+    input.png  mask.png  output.png
+```
+
+`config.toml`:
+
+```toml
+[ai]
+api_key = "sk-..."
+model = ""          # empty = gpt-image-2
+quality = ""        # low | medium | high, empty = automatic
+base_url = ""       # empty = OpenAI
+keep_history = 200  # AI requests to keep
+```
+
+`PIXELFERRITE_CONFIG_DIR` and `PIXELFERRITE_DATA_DIR` move the two folders.
 ## Controls
 
 | | |

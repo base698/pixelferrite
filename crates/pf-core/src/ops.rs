@@ -60,6 +60,36 @@ impl Document {
         self.insert_layer("Add Image", Layer::new(name, px, x, y))
     }
 
+    /// Add an image as a new layer, stretched to fill `rect` (document space).
+    pub fn add_image_scaled(&mut self, name: &str, px: &Pixmap, rect: IRect) -> LayerId {
+        let scaled = crate::aiedit::resize(px, rect.width().max(1) as u32, rect.height().max(1) as u32, image::imageops::FilterType::Lanczos3);
+        self.insert_layer("Add Image", Layer::new(name, scaled, rect.x0, rect.y0))
+    }
+
+    /// Add an image as a new layer that fills the selection: scaled (keeping
+    /// its proportions) to cover the selection's bounds, centred, and cut to
+    /// the selection's shape. `None` if nothing is selected.
+    pub fn add_image_in_selection(&mut self, name: &str, px: &Pixmap) -> Option<LayerId> {
+        let sel = self.state.selection.clone()?;
+        let b = selection::bounds(&sel)?.intersect(self.canvas());
+        if b.is_empty() || px.w == 0 || px.h == 0 {
+            return None;
+        }
+        let (bw, bh) = (b.width() as f32, b.height() as f32);
+        let s = (bw / px.w as f32).max(bh / px.h as f32);
+        let (w, h) = (((px.w as f32 * s).round() as u32).max(b.width() as u32), ((px.h as f32 * s).round() as u32).max(b.height() as u32));
+        let scaled = crate::aiedit::resize(px, w, h, image::imageops::FilterType::Lanczos3);
+        let (ox, oy) = ((w as i32 - b.width()) / 2, (h as i32 - b.height()) / 2);
+        let mut out = scaled.reframed(IRect::xywh(ox, oy, b.width() as u32, b.height() as u32), [0; 4]);
+        for y in 0..b.height() {
+            for x in 0..b.width() {
+                let i = out.idx(x, y) + 3;
+                out.data[i] = ((out.data[i] as u32 * sel.px(b.x0 + x, b.y0 + y)[0] as u32 + 127) / 255) as u8;
+            }
+        }
+        Some(self.insert_layer("Insert Image", Layer::new(name, out, b.x0, b.y0)))
+    }
+
     pub fn delete_layer(&mut self, id: LayerId) {
         let Some(i) = self.state.index_of(id) else { return };
         if self.state.layers.len() <= 1 {
