@@ -156,6 +156,7 @@ impl App {
             id: self.store.new_ai_id(),
             created: timestamp(),
             prompt: prompt.clone(),
+            sent_prompt: ai::full_prompt(&prompt, job.mask.is_some()),
             model: cfg.model.clone(),
             quality: cfg.quality.clone().unwrap_or_default(),
             size: [job.image.w, job.image.h],
@@ -173,7 +174,7 @@ impl App {
         let (tx, rx) = channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let (image, mask) = (job.image.clone(), job.mask.clone());
-        let (store, text, flag, ctx2, keep) = (self.store.clone(), prompt.clone(), cancelled.clone(), ctx.clone(), self.saved.ai.keep_history);
+        let (store, text, flag, ctx2, keep) = (self.store.clone(), record.sent_prompt.clone(), cancelled.clone(), ctx.clone(), self.saved.ai.keep_history);
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
             let result = (|| {
@@ -284,7 +285,11 @@ impl App {
             let edit = egui::TextEdit::multiline(&mut p.text)
                 .desired_rows(3)
                 .desired_width(f32::INFINITY)
-                .hint_text("What should change? e.g. \u{201c}remove the dog\u{201d} or \u{201c}make this look like Rome\u{201d}");
+                .hint_text(if selection {
+                    "What should go in the selected area? e.g. \u{201c}remove the dog\u{201d}. Leave empty to just extend the picture into it."
+                } else {
+                    "What should change? e.g. \u{201c}make this look like Rome\u{201d}"
+                });
             let r = ui.add(edit);
             if std::mem::take(&mut p.focus) {
                 r.request_focus();
@@ -301,7 +306,7 @@ impl App {
                 }
             }
             ui.add_space(10.0);
-            let ready = p.cfg.key.is_some() && !p.text.trim().is_empty();
+            let ready = p.cfg.key.is_some() && (selection || !p.text.trim().is_empty());
             buttons_right(ui, 440.0, |ui| {
                 let cmd_enter = ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
                 send = (ui.add_enabled(ready, egui::Button::new("Send")).on_hover_text("\u{2318}/Ctrl + Enter").clicked() || cmd_enter) && ready;
@@ -360,7 +365,7 @@ impl App {
         let run = self.ai.run.take().unwrap();
         match outcome {
             Ok(px) => {
-                let short: String = run.prompt.chars().take(28).collect();
+                let short: String = if run.prompt.is_empty() { "extend".to_owned() } else { run.prompt.chars().take(28).collect() };
                 canvas::cancel(self);
                 self.doc.insert_ai_result(&run.job, &px, &format!("AI: {short}"));
                 self.toast("AI result added as a new layer");
@@ -401,7 +406,8 @@ impl App {
             });
             let Some(r) = h.records.iter().find(|r| Some(r.id.as_str()) == h.selected.as_deref()) else { return };
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add(egui::Label::new(RichText::new(&r.prompt).strong()).wrap());
+                let shown = if r.prompt.is_empty() { "(no prompt: extend the picture)" } else { r.prompt.as_str() };
+                ui.add(egui::Label::new(RichText::new(shown).strong()).wrap()).on_hover_text(format!("Sent to the model as:\n{}", if r.sent_prompt.is_empty() { &r.prompt } else { &r.sent_prompt }));
                 let status = match r.status.as_str() {
                     "done" => "Done".to_owned(),
                     "error" => "Failed".to_owned(),

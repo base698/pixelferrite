@@ -69,6 +69,8 @@ pub struct AiRecord {
     /// UTC, ISO 8601.
     pub created: String,
     pub prompt: String,
+    /// The full text sent to the model, when the app added to the prompt.
+    pub sent_prompt: String,
     pub model: String,
     pub quality: String,
     /// Size of the image that was sent, in pixels.
@@ -97,6 +99,7 @@ impl Default for AiRecord {
             id: String::new(),
             created: String::new(),
             prompt: String::new(),
+            sent_prompt: String::new(),
             model: String::new(),
             quality: String::new(),
             size: [0, 0],

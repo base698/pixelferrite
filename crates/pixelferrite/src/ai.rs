@@ -123,6 +123,20 @@ pub fn request_size(model: &str, w: u32, h: u32) -> (u32, u32) {
     (snap(rw), snap(rh))
 }
 
+/// The text actually sent. When only part of the picture is to be replaced
+/// the model is told to blend in with the rest and leave it alone; the
+/// user's words (possibly none, meaning "just extend the picture") follow.
+pub fn full_prompt(user: &str, masked: bool) -> String {
+    let user = user.trim();
+    if !masked {
+        return user.to_owned();
+    }
+    let rules = "Fill in only the masked (transparent) area of the mask. Continue the surrounding picture seamlessly into it: \
+                 same art style, colors, lighting and perspective, with lines and objects that reach the edge of the masked area carrying on across it. \
+                 Do not change, restyle or move anything outside the masked area.";
+    if user.is_empty() { format!("{rules} Add nothing new; just extend the existing picture.") } else { format!("{rules} In the masked area: {user}") }
+}
+
 fn multipart(parts: &[(&str, Option<&str>, &[u8])]) -> (String, Vec<u8>) {
     let boundary = format!("pixelferrite-{:016x}", pf_core::document::next_id().wrapping_mul(0x9e37_79b9_7f4a_7c15));
     let mut body = Vec::new();
@@ -269,6 +283,44 @@ mod tests {
         assert!(green[1] > green[0] + 40 && green[1] > green[2] + 40, "green square should still be bottom-left: {green:?}");
         assert!(red[0] > red[1] + 80, "red disc should still be top-right: {red:?}");
         assert!(bg[2] < bg[0].saturating_sub(20), "background should have turned yellow: {bg:?}");
+    }
+
+    /// Extending a picture into a selected strip: the bar that runs to the
+    /// edge of the art must carry on into the masked area, and the art
+    /// itself must come back unchanged.
+    #[test]
+    #[ignore]
+    fn live_extend() {
+        let cfg = Config { quality: Some("low".into()), ..Config::load(&AiSettings::default()) };
+        let (w, h) = (1024u32, 768u32);
+        let mut img = Pixmap::filled(w, h, [255; 4]);
+        let mut mask = Pixmap::filled(w, h, [0, 0, 0, 255]);
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                if x >= 700 {
+                    mask.set(x, y, [0; 4]);
+                    continue;
+                }
+                // Orange sky with a thick tan bar rising to the right.
+                let on_bar = (y - (600 - x / 4)).abs() < 28;
+                img.set(x, y, if on_bar { [150, 125, 80, 255] } else { [235, 140, 40, 255] });
+            }
+        }
+        let sent = full_prompt("", true);
+        let out = edit_pixels(&cfg, &sent, &img, Some(&mask)).unwrap_or_else(|e| panic!("{e}"));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/uitest");
+        std::fs::write(dir.join("ai-live-extend.png"), io::encode_png(&out).unwrap()).unwrap();
+        let white = |p: [u8; 4]| p[0] > 235 && p[1] > 235 && p[2] > 235;
+        let filled = (0..h as i32).step_by(8).filter(|y| !white(out.px(900, *y))).count();
+        eprintln!("{filled} of {} sampled pixels in the masked strip were filled", h / 8);
+        assert!(filled > 80, "the masked strip should be filled in, not left white");
+    }
+
+    #[test]
+    fn prompts() {
+        assert_eq!(full_prompt(" make it Rome ", false), "make it Rome");
+        assert!(full_prompt("a ladybug", true).ends_with("In the masked area: a ladybug"));
+        assert!(full_prompt("", true).contains("just extend"));
     }
 
     /// The whole request/response path against a stand-in server.
