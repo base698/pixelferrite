@@ -59,14 +59,16 @@ fn parse_env(text: &str) -> HashMap<String, String> {
 }
 
 impl Config {
-    /// Read settings from the environment, then from the first `.env` that
-    /// has each one. Read fresh each time so a key added while the app is
-    /// open is picked up.
+    /// Read settings from the nearest `.env` that has each one, falling back
+    /// to the environment. The file wins so that a stale key exported by a
+    /// shell profile can't shadow the one written for this app. Read fresh
+    /// each time so a key added while the app is open is picked up.
     pub fn load() -> Self {
         let files: Vec<HashMap<String, String>> =
             env_files().iter().filter_map(|p| std::fs::read_to_string(p).ok()).map(|t| parse_env(&t)).collect();
         let get = |k: &str| {
-            std::env::var(k).ok().or_else(|| files.iter().find_map(|f| f.get(k).cloned())).filter(|v| !v.trim().is_empty())
+            let set = |v: &String| !v.trim().is_empty();
+            files.iter().find_map(|f| f.get(k).cloned().filter(set)).or_else(|| std::env::var(k).ok().filter(set))
         };
         Self {
             key: get("OPENAI_API_KEY"),
