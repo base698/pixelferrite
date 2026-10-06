@@ -42,7 +42,12 @@ PLIST
 codesign --force --sign - "$app"
 
 if [ "${1:-}" != "--no-shortcut" ]; then
-    ln -sfn "$PWD/$app" "$HOME/Desktop/Pixelferrite.app"
-    echo "shortcut: $HOME/Desktop/Pixelferrite.app"
+    # A Finder alias rather than a symlink: Finder draws a symlink to an app
+    # with a blank icon. An existing alias keeps working across rebuilds.
+    if [ ! -e "$HOME/Desktop/Pixelferrite" ]; then
+        osascript -e "tell application \"Finder\" to make alias file to (POSIX file \"$PWD/$app\") at desktop" \
+            -e 'tell application "Finder" to set name of result to "Pixelferrite"' >/dev/null
+    fi
+    echo "shortcut: $HOME/Desktop/Pixelferrite"
 fi
 echo "built: $PWD/$app"
