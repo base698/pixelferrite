@@ -70,6 +70,14 @@ impl AiUi {
         self.prompt.is_some() || self.error.is_some() || self.settings.is_some()
     }
 
+    /// Lets the README screenshots show a neutral key location.
+    #[cfg(test)]
+    pub fn set_key_source(&mut self, source: &str) {
+        if let Some(p) = &mut self.prompt {
+            p.cfg.key_source = source.into();
+        }
+    }
+
     #[cfg(test)]
     pub fn prompt_open(&self) -> bool {
         self.prompt.is_some()
@@ -416,7 +424,13 @@ impl App {
                 };
                 let secs = r.duration_ms as f32 / 1000.0;
                 ui.label(RichText::new(format!("{status} \u{b7} {} \u{b7} {}\u{d7}{} px \u{b7} {secs:.1} s", r.model, r.size[0], r.size[1])).small().weak());
-                let from = if r.document.is_empty() { "an unsaved image" } else { r.document.as_str() };
+                // Paths under the home folder read better, and screenshot better, as ~/...
+                let home = std::env::var("HOME").unwrap_or_default();
+                let short = match r.document.strip_prefix(&home) {
+                    Some(rest) if !home.is_empty() && rest.starts_with('/') => format!("~{rest}"),
+                    _ => r.document.clone(),
+                };
+                let from = if short.is_empty() { "an unsaved image" } else { short.as_str() };
                 let part = if r.selection { "the selection in" } else { "all of" };
                 let what = if r.source == "visible" { "everything visible".to_owned() } else { format!("only layer \u{201c}{}\u{201d}", r.layer) };
                 ui.label(RichText::new(format!("Sent {part} {from}: {what}")).small().weak());

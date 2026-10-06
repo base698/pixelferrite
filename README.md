@@ -1,25 +1,229 @@
-# Pixelferrite
+<p align="center">
+  <img src="assets/icon.png" alt="Pixelferrite icon: three stacked layers" width="128">
+</p>
 
-A layered image editor in Rust for macOS and Linux.
+<h1 align="center">Pixelferrite</h1>
+
+<p align="center">
+  <b>A light, Pixelmator-style image editor with AI painting, written in Rust.</b><br>
+  Layers, masks, brushes, smart selections, text on a path and a shelf of filters,<br>
+  plus one menu item that hands any part of the picture to an image model and gets a new layer back.
+</p>
+
+<p align="center">
+  <img alt="Written in Rust" src="https://img.shields.io/badge/written%20in-Rust-b7410e?style=flat-square&logo=rust">
+  <img alt="macOS and Linux" src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux-native-2f7bf5?style=flat-square">
+  <img alt="AI edits through OpenAI" src="https://img.shields.io/badge/AI%20edits-OpenAI-3a3a3a?style=flat-square">
+  <img alt="Status: early" src="https://img.shields.io/badge/status-early-d69e2e?style=flat-square">
+</p>
+
+<br>
+
+<p align="center">
+  <img src="docs/images/remove-prompt.jpg" alt="Pixelferrite with Van Gogh's The Starry Night open, a lasso selection around the cypress tree, and the Send to AI dialog showing a preview of what will be sent and the prompt 'remove the cypress tree'" width="100%">
+  <br>
+  <sub>Lasso the cypress, say what you want, and see exactly what will be sent before it goes.<br>
+  <i>The Starry Night</i>, Vincent van Gogh, 1889</sub>
+</p>
+
+<p align="center">
+  <a href="#paint-with-a-prompt">AI painting</a> ·
+  <a href="#select-what-you-mean">Selections</a> ·
+  <a href="#type-filters-and-geometry">Type &amp; filters</a> ·
+  <a href="#everything-in-the-box">Everything in the box</a> ·
+  <a href="#get-started">Get started</a> ·
+  <a href="#under-the-hood">Under the hood</a> ·
+  <a href="#reference">Reference</a>
+</p>
+
+<br>
+
+<table>
+  <tr>
+    <td width="25%" valign="top">
+      <h3>Small on purpose</h3>
+      The tools you reach for every day, in the places a Pixelmator user expects them: layers on the left, tools on the right, options beside them. About ten thousand lines of Rust.
+    </td>
+    <td width="25%" valign="top">
+      <h3>AI where you point</h3>
+      Select an area, type a prompt, and the answer lands as a new layer cut to your selection. Erase things, add things, or extend a picture past its edges.
+    </td>
+    <td width="25%" valign="top">
+      <h3>Native and quick</h3>
+      One binary drawn on the GPU through wgpu. No Electron, no web view, and the computer-vision filters are plain Rust, so there is nothing else to install.
+    </td>
+    <td width="25%" valign="top">
+      <h3>Open files</h3>
+      Documents are OpenRaster (<code>.ora</code>), which Krita, GIMP and MyPaint also open. Export to PNG, JPEG or GIF.
+    </td>
+  </tr>
+</table>
+
+<br>
+
+Every screenshot here is the real app at work on public-domain art, driven and rendered offscreen by the test
+harness in [`demo.rs`](crates/pixelferrite/src/demo.rs). The AI results are real answers from the model, unretouched.
+
+## Paint with a prompt
+
+**Layer > Send to AI with Prompt…** sends what you are looking at to OpenAI's image model. With a selection, only
+that area is replaced and the rest of the picture goes along as context, so the new pixels match the brushwork,
+light and colour around them.
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/images/remove-result.jpg" alt="The Starry Night with the cypress tree gone; the sky, hills and village continue where it stood, and a new layer named 'AI: remove the cypress tree' sits above the painting" width="100%">
+      <br>
+      <sub>The answer to the prompt above, as its own layer over the untouched original.<br><i>The Starry Night</i>, Vincent van Gogh, 1889</sub>
+      <h3>Erase it</h3>
+      "Remove the cypress tree." The sky, the hills and the village carry on where it stood. The result is a separate layer cut to the selection, so the original is still underneath: hide it, mask it or throw it away.
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/images/ai-history.jpg" alt="The AI Requests window listing the request, with the image that was sent and the image that came back side by side, and buttons to add the result as a layer, reuse the prompt, show the files or delete" width="100%">
+      <br>
+      <sub>Layer > AI Requests…: what was sent, what came back, and how long it took.</sub>
+      <h3>Keep the receipts</h3>
+      Every request is saved with its prompt, the exact image and mask that were sent, and the answer. Add an old result back as a layer, reuse a prompt, or open the files.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/images/extend-before.jpg" alt="Friedrich's Wanderer above the Sea of Fog, a portrait painting, placed in the middle of a wide canvas with the empty space on both sides selected" width="100%">
+      <br>
+      <sub>A portrait painting on a landscape canvas, with the empty sides selected.<br><i>Wanderer above the Sea of Fog</i>, Caspar David Friedrich, c. 1818</sub>
+      <h3>Go past the frame</h3>
+      Put a picture on a bigger canvas and select the empty part. Give it a hint, or leave the prompt blank to simply continue what is there.
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/images/extend-result.jpg" alt="The same canvas after the AI edit: the fog, rocks and distant ridges now continue to both edges of the wide canvas" width="100%">
+      <br>
+      <sub>"Continue the sea of fog and the distant peaks." The wanderer himself is not touched.</sub>
+      <h3>And it keeps going</h3>
+      The fog and ridges run out to both edges. Look closely and you can find the join on the left; the new part is a layer of its own, so a soft eraser or a mask tidies it up.
+    </td>
+  </tr>
+</table>
+
+You bring your own OpenAI key (File > Settings, or a `.env` file). Each request is one paid API call and the picture
+is uploaded to OpenAI; nothing is sent until you press Send.
+
+## Select what you mean
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/images/subject.jpg" alt="Vermeer's Girl with a Pearl Earring with a selection outline following her turban, face and jacket against the dark background" width="100%">
+      <br>
+      <sub>Select Subject: one dragged box, and the outline finds her.<br><i>Girl with a Pearl Earring</i>, Johannes Vermeer, c. 1665</sub>
+      <h3>One box, one subject</h3>
+      <b>Select Subject</b> (U) separates what is inside your box from the background by colour and edges. <b>Region Selection</b> (Y) picks an area up to its edges with a click, and the <b>magic wand</b>, <b>quick selection</b>, lasso, rectangle and ellipse are all here too.
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/images/subject-mask.jpg" alt="The same painting with the background hidden by a layer mask, leaving the girl on a transparent checkerboard; the layer list shows the mask thumbnail" width="100%">
+      <br>
+      <sub>Mask Layer with Selection: the background is hidden, not deleted.</sub>
+      <h3>Cut out, without cutting</h3>
+      Turn any selection into a layer mask and paint on the mask to refine it. Every selection tool adds, subtracts and intersects, with buttons or with Shift and Option.
+    </td>
+  </tr>
+</table>
+
+## Type, filters and geometry
+
+<table>
+  <tr>
+    <td colspan="2" valign="top">
+      <img src="docs/images/text-path.jpg" alt="The Starry Night with the words 'The Starry Night, 1889' in pale yellow curving over the hills along a drawn path, and the Type options panel open" width="100%">
+      <br>
+      <sub>Drag with the Type tool to draw a path; the text follows it and stays editable.</sub>
+      <h3>Text that follows a line</h3>
+      Click to place text, or drag to draw the line it runs along. Any installed font, with size, spacing, alignment and colour. A selection's outline can become the path too, so text can wrap around whatever you selected.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/images/edges.jpg" alt="The Edge Detection dialog over The Starry Night, which is previewed as black line art of its brush strokes on white" width="100%">
+      <br>
+      <sub>Edge Detection turning brush strokes into line art, previewed live.</sub>
+      <h3>Filters you can watch</h3>
+      Every filter previews on the canvas while you move its sliders. Blur and sharpen, heal a selection, reduce noise, fix contrast, match one picture's colours to another, or trace the edges.
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/images/perspective.jpg" alt="The Perspective tool with four corner handles on The Starry Night; the right-hand corners have been pulled in so the painting recedes" width="100%">
+      <br>
+      <sub>Perspective: four handles on the canvas, Distort or Straighten.</sub>
+      <h3>Bend it, or straighten it</h3>
+      Drag four corners to put a picture into perspective, or mark the corners of a photographed page and pull it square. Lens correction and content-aware scaling live in the same menu.
+    </td>
+  </tr>
+</table>
+
+## Everything in the box
+
+| | |
+|---|---|
+| **Layers** | Blend modes, opacity, masks, reorder, merge, duplicate, flip, lock and hide; undo and redo with a history list |
+| **Paint** | Brush, pencil, eraser, gradient, fill, clone stamp, smudge, colour picker |
+| **Select** | Rectangle, ellipse, lasso, quick selection, magic wand, Select Subject, Region Selection; add, subtract, intersect |
+| **Type** | Straight or along a path, system fonts, editable after saving |
+| **Filters** | Gaussian and surface blur, sharpen, heal, reduce noise, auto contrast, equalize, local contrast, threshold, match colours, perspective, lens distortion, content-aware scale, edge detection |
+| **AI** | Edit a selection, restyle a whole image, extend past the edges; request history |
+| **Canvas** | Pinch to zoom, two-finger rotate, a zoom slider in the toolbar |
+| **Files** | OpenRaster `.ora` documents; opens and inserts PNG, JPEG, GIF, WebP and more; exports PNG, JPEG, GIF |
+
+It is a light take on the idea, not a replacement: there are no adjustment layers, layer styles, shapes, RAW
+development or colour management yet, and text is typed in the side panel instead of on the canvas.
+
+## Get started
+
+You need a [Rust toolchain](https://rustup.rs).
 
 ```sh
-cargo run --release -p pixelferrite            # empty canvas
-cargo run --release -p pixelferrite -- photo.jpg
+git clone https://github.com/base698/pixelferrite
+cd pixelferrite
+cargo run --release -p pixelferrite                # empty canvas
+cargo run --release -p pixelferrite -- photo.jpg   # open a picture
 ```
 
-Linux needs the usual winit/wgpu system packages (X11 or Wayland dev libraries
-and a Vulkan or GL driver); file dialogs go through the XDG desktop portal.
+**macOS:** `./scripts/bundle-macos.sh` builds `dist/Pixelferrite.app` and puts a shortcut on the Desktop. The app is
+built for your own machine and signed ad hoc; it is not notarized for handing to others.
 
-## Layout
+**Linux:** the same commands, with the usual winit and wgpu system packages (X11 or Wayland development libraries
+and a Vulkan or GL driver). File dialogs go through the XDG desktop portal. Development so far has been on macOS, so
+expect rough edges and please report them.
 
-- `crates/pf-core` — document model, compositor, tools and file formats. No
-  GUI dependencies; everything is covered by headless tests.
-- `crates/pixelferrite` — the egui/eframe application.
+**AI edits** need an OpenAI key. Put it in File > Settings, or in a `.env` file next to where you run the app:
 
-`cargo test` runs the core tests plus a headless UI test that drives the real
-app with synthetic pointer input and writes rendered frames to `target/uitest/`.
+```
+OPENAI_API_KEY=sk-...
+```
 
-## Files
+## Under the hood
+
+- **`crates/pf-core`**: the engine. Document model, compositor, painting, selections, text, filters and file
+  formats, with no GUI dependency and its own headless tests.
+- **`crates/pixelferrite`**: the app, built on [egui](https://github.com/emilk/egui) and eframe, drawn with wgpu
+  (Metal on macOS, Vulkan or GL on Linux).
+
+The vision algorithms are the classics, written in Rust instead of linked from OpenCV: Canny edges, bilateral
+and non-local-means smoothing, CLAHE, GrabCut, watershed, seam carving and homography warps.
+
+```sh
+cargo test                       # engine tests, plus UI tests that drive the real app offscreen
+```
+
+The README screenshots come from the same harness. With the three paintings in a folder:
+
+```sh
+PF_DEMO_ART=/path/to/art cargo test --release -p pixelferrite readme_ -- --ignored
+```
+
+That writes PNGs to `target/demo/`. The two `readme_ai_*` tests call OpenAI with your key.
+
+## Reference
+
+### Files
 
 The native format is [OpenRaster](https://www.openraster.org/) (`.ora`), which
 Krita, GIMP and MyPaint also open. Layer masks are stored as extra PNGs inside
@@ -28,14 +232,14 @@ path as extra attributes so they stay editable (other apps see the rendered
 pixels). Export writes PNG, JPEG or GIF. Undo history lives in memory for the
 session and is not written to the file.
 
-## Text
+### Text
 
 With the type tool (T), click to place text or drag to draw a path that new
 text follows. Click existing text to edit it; its options are in the inspector.
 "Redraw Path" gives existing text a new path and "Straighten" removes it.
 Painting on a text layer, or filtering it, turns it into ordinary pixels.
 
-## Filters
+### Filters
 
 Filters live in the Filter menu and preview on the canvas until you press
 Apply. They affect the active layer (or its mask when that is being edited),
@@ -54,7 +258,7 @@ limited to the selection if there is one. To add one, add a variant to
 These are native Rust implementations of the classic OpenCV algorithms, so
 there is no native library to install.
 
-## Smart selection
+### Smart selection
 
 - **Select Subject** (U): drag a box around something; GrabCut separates it
   from the background inside the box.
@@ -62,7 +266,7 @@ there is no native library to install.
   (watershed); drag to sweep up several. "Detail" sets how fine the regions are.
 - **Select > Selection Outline to Text Path**: text runs around the selection.
 
-## AI edits
+### AI edits
 
 Layer > "Send to AI with Prompt…" (also in a layer's right-click menu) asks
 for a prompt and sends the active layer to OpenAI's image model; the answer
@@ -85,17 +289,17 @@ OPENAI_IMAGE_MODEL=gpt-image-2
 OPENAI_IMAGE_QUALITY=medium
 ```
 
-`.env` is git-ignored. `cargo test -p pixelferrite -- --ignored live` sends two
+`.env` is git-ignored. `cargo test -p pixelferrite -- --ignored live` sends three
 small real requests to check the key and model.
 
-## Inserting images
+### Inserting images
 
 File > "Insert Image as New Layer…" adds an image centred on the canvas (so
 does dropping a file on the window). "Insert Image into Selection…" scales
 it to fill the selection, keeping its proportions, and cuts it to the
 selection's shape, as a new layer.
 
-## Saved data
+### Saved data
 
 ```
 ~/.config/pixelferrite/            ($XDG_CONFIG_HOME)
@@ -119,7 +323,8 @@ keep_history = 200  # AI requests to keep
 ```
 
 `PIXELFERRITE_CONFIG_DIR` and `PIXELFERRITE_DATA_DIR` move the two folders.
-## Controls
+
+### Controls
 
 | | |
 |---|---|
@@ -136,7 +341,7 @@ Tool keys: V arrange, M / O / L rectangle, ellipse and free selection, Q quick
 selection, W magic wand, U select subject, Y region selection, B brush, N pencil, E eraser, G gradient, K fill,
 S clone stamp, R smudge, T type, I color picker, H hand, Z zoom.
 
-## Mac app bundle
+### Mac app bundle
 
 ```sh
 ./scripts/bundle-macos.sh              # builds dist/Pixelferrite.app and links it on the Desktop
@@ -145,3 +350,12 @@ S clone stamp, R smudge, T type, I color picker, H hand, Z zoom.
 
 The bundle is built for the machine it runs on and signed ad hoc, so it is for
 local use rather than distribution.
+
+## Credits
+
+The demo paintings are public-domain scans from [Wikimedia Commons](https://commons.wikimedia.org/):
+*The Starry Night* (Vincent van Gogh, 1889), *Wanderer above the Sea of Fog* (Caspar David Friedrich, c. 1818) and
+*Girl with a Pearl Earring* (Johannes Vermeer, c. 1665).
+
+Pixelferrite is an independent project. It is not affiliated with or endorsed by Pixelmator or Apple, and
+"Pixelmator" is their trademark.

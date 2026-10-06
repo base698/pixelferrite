@@ -70,7 +70,10 @@ pub fn open(path: &Path) -> Result<Document> {
         doc.path = Some(path.to_owned());
         Ok(doc)
     } else {
-        Ok(Document::from_pixmap(load_pixmap(path)?, "Layer"))
+        // The layer takes the picture's name; the document stays untitled so
+        // saving never overwrites the imported file.
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Layer");
+        Ok(Document::from_pixmap(load_pixmap(path)?, name))
     }
 }
 

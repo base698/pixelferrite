@@ -11,6 +11,8 @@ mod view;
 
 #[cfg(test)]
 mod uitest;
+#[cfg(test)]
+mod demo;
 
 use std::path::PathBuf;
 
