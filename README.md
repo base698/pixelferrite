@@ -135,3 +135,13 @@ keep_history = 200  # AI requests to keep
 Tool keys: V arrange, M / O / L rectangle, ellipse and free selection, Q quick
 selection, W magic wand, U select subject, Y region selection, B brush, N pencil, E eraser, G gradient, K fill,
 S clone stamp, R smudge, T type, I color picker, H hand, Z zoom.
+
+## Mac app bundle
+
+```sh
+./scripts/bundle-macos.sh              # builds dist/Pixelferrite.app and links it on the Desktop
+./scripts/bundle-macos.sh --no-shortcut
+```
+
+The bundle is built for the machine it runs on and signed ad hoc, so it is for
+local use rather than distribution.

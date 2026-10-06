@@ -44,7 +44,8 @@ pub fn env_files() -> Vec<PathBuf> {
         }
     };
     walk(std::env::current_dir().ok(), 6);
-    walk(std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)), 4);
+    // Deep enough to reach the repository from dist/Pixelferrite.app/Contents/MacOS.
+    walk(std::env::current_exe().ok().and_then(|p| p.canonicalize().ok()).and_then(|p| p.parent().map(PathBuf::from)), 6);
     if let Some(home) = std::env::var_os("HOME") {
         out.push(PathBuf::from(home).join(".config/pixelferrite/.env"));
     }

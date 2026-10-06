@@ -23,6 +23,8 @@ fn main() -> eframe::Result {
                 println!("usage: pixelferrite [FILE]\n\nOpens an image (.ora, .png, .jpg, .gif, .webp, ...) for editing.");
                 return Ok(());
             }
+            // Older macOS versions pass a process serial number when launched from Finder.
+            _ if a.starts_with("-psn_") => {}
             _ => file = Some(PathBuf::from(a)),
         }
     }
