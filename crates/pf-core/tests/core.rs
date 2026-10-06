@@ -342,12 +342,12 @@ fn edge_detection_filter() {
 
 #[test]
 fn ai_edit_round_trip() {
-    use pf_core::aiedit;
+    use pf_core::aiedit::{self, Source};
     let mut doc = Document::new(400, 300, Some(WHITE));
     let base = doc.state.active;
 
     // Whole layer: everything is sent, nothing is masked, the answer covers it all.
-    let job = aiedit::prepare(&doc.state, |_, _| (512, 384)).unwrap();
+    let job = aiedit::prepare(&doc.state, Source::Layer, |_, _| (512, 384)).unwrap();
     assert_eq!((job.rect, job.image.w, job.image.h), (IRect::new(0, 0, 400, 300), 512, 384));
     assert!(job.mask.is_none());
     let id = doc.insert_ai_result(&job, &Pixmap::filled(512, 384, RED), "AI: rome");
@@ -360,7 +360,7 @@ fn ai_edit_round_trip() {
 
     // Selection: context around it is sent, the mask marks it, and only it is replaced.
     doc.select("r", &selection::rect_mask(400, 300, IRect::new(150, 100, 250, 200)), Combine::Replace);
-    let job = aiedit::prepare(&doc.state, |w, h| (w * 2, h * 2)).unwrap();
+    let job = aiedit::prepare(&doc.state, Source::Layer, |w, h| (w * 2, h * 2)).unwrap();
     assert!(job.rect.contains_rect(IRect::new(110, 60, 290, 240)), "should include surroundings: {:?}", job.rect);
     let mask = job.mask.as_ref().unwrap();
     assert_eq!((mask.w, mask.h), (job.image.w, job.image.h));
@@ -377,9 +377,25 @@ fn ai_edit_round_trip() {
     let l = doc.state.layer(id).unwrap();
     assert!(l.pixels.w < 140 && l.pixels.h < 140, "new layer is trimmed to the selection");
 
+    // "What you see": layers above and below are in the picture that is
+    // sent, and the answer goes on top of all of them.
+    let mut doc = Document::new(200, 100, Some(WHITE));
+    let art = doc.add_image_layer("art", Pixmap::filled(100, 100, RED));
+    doc.state.layer_mut(art).unwrap().x = 0;
+    doc.state.active = doc.state.layers[0].id;
+    doc.select("r", &selection::rect_mask(200, 100, IRect::new(100, 0, 200, 100)), Combine::Replace);
+    let only = aiedit::prepare(&doc.state, Source::Layer, |w, h| (w, h)).unwrap();
+    assert!(only.image.data.chunks_exact(4).all(|p| p == WHITE), "the layer alone is blank white");
+    let job = aiedit::prepare(&doc.state, Source::Visible, |w, h| (w, h)).unwrap();
+    assert_eq!(job.rect, IRect::new(52, 0, 200, 100));
+    assert_eq!((job.image.px(10, 50), job.image.px(140, 50)), (RED, WHITE), "the art next to the selection is sent as context");
+    let id = doc.insert_ai_result(&job, &Pixmap::filled(job.image.w, job.image.h, [0, 0, 255, 255]), "AI");
+    assert_eq!(doc.state.layers.last().unwrap().id, id, "result sits above every layer");
+    assert_eq!((px(&doc, 150, 50), px(&doc, 50, 50)), ([0, 0, 255, 255], RED));
+
     // Nothing to send when the selection misses the layer.
     doc.select("r", &selection::rect_mask(400, 300, IRect::new(0, 0, 10, 10)), Combine::Replace);
     let small = doc.add_image_layer("small", Pixmap::filled(20, 20, RED));
     doc.state.active = small;
-    assert!(aiedit::prepare(&doc.state, |w, h| (w, h)).is_none());
+    assert!(aiedit::prepare(&doc.state, Source::Layer, |w, h| (w, h)).is_none());
 }

@@ -302,7 +302,7 @@ fn edge_detection_and_ai_edit() {
     });
     let cfg = crate::ai::Config { key: Some("sk-test".into()), model: "gpt-image-2".into(), base, quality: None, key_source: "a test".into() };
     let layers = h.state().doc.state.layers.len();
-    h.state_mut().send_to_ai(&ctx, "remove the red circle".into(), cfg);
+    h.state_mut().send_to_ai(&ctx, "remove the red circle".into(), cfg, pf_core::aiedit::Source::Visible);
     assert!(h.state().ai.running());
     h.run_steps(2);
     h.render().unwrap().save(out.join("ai-working.png")).unwrap();
@@ -331,6 +331,7 @@ fn edge_detection_and_ai_edit() {
     assert_eq!(recs.len(), 1);
     let r = &recs[0];
     assert_eq!((r.status.as_str(), r.prompt.as_str(), r.layer.as_str(), r.selection), ("done", "remove the red circle", "Background", true));
+    assert_eq!(r.source, "visible");
     assert_eq!([r.region[2] - r.region[0], r.region[3] - r.region[1]].map(|v| v > 300), [true, true]);
     for f in ["request.json", "input.png", "mask.png", "output.png"] {
         assert!(store.ai_path(&r.id).join(f).exists(), "{f} should be saved");

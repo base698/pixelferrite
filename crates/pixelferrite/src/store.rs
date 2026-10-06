@@ -78,6 +78,8 @@ pub struct AiRecord {
     pub layer: String,
     /// Area of the document that was sent: x0, y0, x1, y1.
     pub region: [i32; 4],
+    /// "visible" (all visible layers, merged) or "layer" (that layer alone).
+    pub source: String,
     /// Whether only a selection inside `region` was to be replaced.
     pub selection: bool,
     /// "running", "done", "error" or "cancelled".
@@ -101,6 +103,7 @@ impl Default for AiRecord {
             document: String::new(),
             layer: String::new(),
             region: [0; 4],
+            source: "layer".to_owned(),
             selection: false,
             status: "running".to_owned(),
             error: String::new(),

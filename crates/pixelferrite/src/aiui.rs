@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use egui::{Color32, ColorImage, Context, Key, RichText, TextureHandle, TextureOptions, vec2};
-use pf_core::aiedit::{self, AiJob};
+use pf_core::aiedit::{self, AiJob, Source};
 use pf_core::{IRect, Pixmap, io};
 
 use crate::ai;
@@ -21,6 +21,7 @@ struct Prompt {
     text: String,
     cfg: ai::Config,
     focus: bool,
+    source: Source,
     /// Exactly what would be sent, with the part that stays dimmed.
     preview: TextureHandle,
 }
@@ -46,14 +47,21 @@ struct SettingsDlg {
     show_key: bool,
 }
 
-#[derive(Default)]
 pub struct AiUi {
     prompt: Option<Prompt>,
     run: Option<Run>,
     error: Option<String>,
     last_prompt: String,
+    /// Remembered choice of what to send.
+    source: Source,
     history: Option<History>,
     settings: Option<SettingsDlg>,
+}
+
+impl Default for AiUi {
+    fn default() -> Self {
+        Self { prompt: None, run: None, error: None, last_prompt: String::new(), source: Source::Visible, history: None, settings: None }
+    }
 }
 
 impl AiUi {
@@ -105,13 +113,9 @@ impl App {
         self.open_ai_prompt_with(None);
     }
 
-    fn open_ai_prompt_with(&mut self, text: Option<String>) {
-        if self.ai.run.is_some() {
-            return self.toast("The AI is still working on the last request");
-        }
-        let Some(mut job) = aiedit::prepare(&self.doc.state, |w, h| fit(w, h, 560.0)) else {
-            return self.toast("Nothing to send: the selection doesn't touch this layer");
-        };
+    /// A picture of exactly what `source` would send right now.
+    fn ai_preview(&self, source: Source) -> Option<TextureHandle> {
+        let mut job = aiedit::prepare(&self.doc.state, source, |w, h| fit(w, h, 560.0))?;
         // Preview: checkerboard under transparency, and dim what won't change.
         for (i, p) in job.image.data.chunks_exact_mut(4).enumerate() {
             let (x, y) = (i as u32 % job.image.w, i as u32 / job.image.w);
@@ -124,16 +128,29 @@ impl App {
             }
             p[3] = 255;
         }
-        let preview = texture(&self.ctx, "ai-preview", &job.image);
+        Some(texture(&self.ctx, "ai-preview", &job.image))
+    }
+
+    fn open_ai_prompt_with(&mut self, text: Option<String>) {
+        if self.ai.run.is_some() {
+            return self.toast("The AI is still working on the last request");
+        }
+        // Send what the user is looking at unless they say otherwise.
+        let source = self.ai.source;
+        let Some((source, preview)) = [source, Source::Visible].into_iter().find_map(|s| Some((s, self.ai_preview(s)?))) else {
+            return self.toast("Nothing to send: the selection is outside the image");
+        };
         let cfg = ai::Config::load(&self.saved.ai);
-        self.ai.prompt = Some(Prompt { text: text.unwrap_or_else(|| self.ai.last_prompt.clone()), cfg, focus: true, preview });
+        self.ai.prompt = Some(Prompt { text: text.unwrap_or_else(|| self.ai.last_prompt.clone()), cfg, focus: true, source, preview });
     }
 
     /// Send the active layer (or the selected part of it) to the model. The
     /// request is recorded on disk before it leaves.
-    pub fn send_to_ai(&mut self, ctx: &Context, prompt: String, cfg: ai::Config) {
+    pub fn send_to_ai(&mut self, ctx: &Context, prompt: String, cfg: ai::Config, source: Source) {
         let model = cfg.model.clone();
-        let Some(job) = aiedit::prepare(&self.doc.state, |w, h| ai::request_size(&model, w, h)) else { return };
+        let Some(job) = aiedit::prepare(&self.doc.state, source, |w, h| ai::request_size(&model, w, h)) else {
+            return self.toast("Nothing to send: the selection doesn't touch this layer");
+        };
         let r = job.rect;
         let mut record = AiRecord {
             id: self.store.new_ai_id(),
@@ -145,6 +162,7 @@ impl App {
             document: self.source_file().map(|p| p.display().to_string()).unwrap_or_default(),
             layer: self.doc.state.layer(job.layer).map(|l| l.name.clone()).unwrap_or_default(),
             region: [r.x0, r.y0, r.x1, r.y1],
+            source: if source == Source::Visible { "visible" } else { "layer" }.to_owned(),
             selection: job.mask.is_some(),
             ..Default::default()
         };
@@ -237,17 +255,26 @@ impl App {
     fn ai_prompt_dialog(&mut self, ctx: &Context) {
         let layer = self.doc.state.active_layer().map_or("layer", |l| l.name.as_str()).to_owned();
         let selection = self.doc.state.selection.is_some();
+        let layers = self.doc.state.layers.iter().filter(|l| l.visible).count();
         let Some(p) = &mut self.ai.prompt else { return };
         let (mut send, mut close) = (false, false);
+        let was = p.source;
         egui::Modal::new(egui::Id::new("ai-prompt")).show(ctx, |ui| {
             ui.set_width(440.0);
             ui.heading("Send to AI");
             ui.add_space(4.0);
-            let what = if selection {
-                format!("This is what will be sent: the selected part of \u{201c}{layer}\u{201d} plus some surroundings for context. Only the bright area is replaced.")
-            } else {
-                format!("This is what will be sent: all of \u{201c}{layer}\u{201d}.")
-            };
+            ui.horizontal(|ui| {
+                ui.label("Send");
+                ui.selectable_value(&mut p.source, Source::Visible, "Everything visible").on_hover_text("The image as you see it, all layers merged. The result goes on top.");
+                ui.selectable_value(&mut p.source, Source::Layer, format!("Only \u{201c}{layer}\u{201d}")).on_hover_text("This layer by itself; the AI won't see the others. The result goes just above it.");
+            });
+            let mut what = "This is exactly what the AI will see.".to_owned();
+            if selection {
+                what += " Only the bright (selected) area is replaced; the rest is context.";
+            }
+            if p.source == Source::Layer && layers > 1 {
+                what += " Other layers are not included.";
+            }
             ui.label(RichText::new(what).weak());
             ui.add_space(4.0);
             let size = p.preview.size_vec2();
@@ -281,9 +308,23 @@ impl App {
                 close = ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
             });
         });
+        if p.source != was {
+            let source = p.source;
+            match self.ai_preview(source) {
+                Some(t) => {
+                    self.ai.prompt.as_mut().unwrap().preview = t;
+                    self.ai.source = source;
+                }
+                None => {
+                    self.ai.prompt.as_mut().unwrap().source = was;
+                    self.toast("The selection doesn't touch that layer");
+                }
+            }
+        }
         if send {
             let p = self.ai.prompt.take().unwrap();
-            self.send_to_ai(ctx, p.text.trim().to_owned(), p.cfg);
+            self.ai.source = p.source;
+            self.send_to_ai(ctx, p.text.trim().to_owned(), p.cfg, p.source);
         } else if close {
             self.ai.last_prompt = self.ai.prompt.take().unwrap().text;
         }
@@ -370,8 +411,9 @@ impl App {
                 let secs = r.duration_ms as f32 / 1000.0;
                 ui.label(RichText::new(format!("{status} \u{b7} {} \u{b7} {}\u{d7}{} px \u{b7} {secs:.1} s", r.model, r.size[0], r.size[1])).small().weak());
                 let from = if r.document.is_empty() { "an unsaved image" } else { r.document.as_str() };
-                let part = if r.selection { "selection in" } else { "all of" };
-                ui.label(RichText::new(format!("Sent {part} layer \u{201c}{}\u{201d} of {from}", r.layer)).small().weak());
+                let part = if r.selection { "the selection in" } else { "all of" };
+                let what = if r.source == "visible" { "everything visible".to_owned() } else { format!("only layer \u{201c}{}\u{201d}", r.layer) };
+                ui.label(RichText::new(format!("Sent {part} {from}: {what}")).small().weak());
                 if !r.error.is_empty() {
                     ui.colored_label(WARN, &r.error);
                 }
