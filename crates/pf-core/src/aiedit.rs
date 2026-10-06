@@ -90,7 +90,8 @@ pub fn prepare(state: &DocState, source: Source, size_for: impl Fn(u32, u32) -> 
         }
     };
     let (w, h) = size_for(crop.w, crop.h);
-    let image = resize(&crop, w, h, FilterType::CatmullRom);
+    let mut image = resize(&crop, w, h, FilterType::CatmullRom);
+    fill_empty(&mut image);
     let (mask, clip) = match sel {
         Some(s) => {
             let part = s.reframed(rect, [0]);
@@ -107,6 +108,76 @@ pub fn prepare(state: &DocState, source: Source, size_for: impl Fn(u32, u32) -> 
         None => (None, None),
     };
     Some(AiJob { source, layer: layer.id, rect, image, mask, clip })
+}
+
+/// Paint over transparency with a soft continuation of the nearby colours.
+/// The model treats see-through pixels as black and tends to leave them that
+/// way, so empty canvas has to arrive looking like a rough guess instead.
+fn fill_empty(px: &mut Pixmap) {
+    if px.data.chunks_exact(4).all(|p| p[3] == 255) {
+        return;
+    }
+    // Pull: average what is there into ever smaller copies.
+    let first: Vec<[f32; 4]> = px
+        .data
+        .chunks_exact(4)
+        .map(|p| {
+            let a = p[3] as f32 / 255.0;
+            [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a, a]
+        })
+        .collect();
+    let mut levels = vec![(px.w as usize, px.h as usize, first)];
+    while let Some((w, h, cur)) = levels.last().filter(|l| l.0 > 1 || l.1 > 1) {
+        let (w, h) = (*w, *h);
+        let (nw, nh) = (w.div_ceil(2), h.div_ceil(2));
+        let mut next = vec![[0f32; 4]; nw * nh];
+        for y in 0..h {
+            for x in 0..w {
+                let (src, dst) = (cur[y * w + x], &mut next[(y / 2) * nw + x / 2]);
+                for c in 0..4 {
+                    dst[c] += src[c];
+                }
+            }
+        }
+        for v in &mut next {
+            if v[3] > 1.0 {
+                *v = v.map(|c| c / v[3]);
+            }
+        }
+        levels.push((nw, nh, next));
+    }
+    let top = levels.last_mut().expect("at least one level");
+    for v in &mut top.2 {
+        // Nothing opaque anywhere: plain white is as good a start as any.
+        *v = if v[3] > 0.0 { [v[0] / v[3], v[1] / v[3], v[2] / v[3], 1.0] } else { [255.0, 255.0, 255.0, 1.0] };
+    }
+    // Push: fill each level's gaps from the smoother level above it.
+    for i in (0..levels.len() - 1).rev() {
+        let (fine, coarse) = levels.split_at_mut(i + 1);
+        let ((w, h, cur), (cw, ch, up)) = (&mut fine[i], &coarse[0]);
+        for y in 0..*h {
+            for x in 0..*w {
+                let v = &mut cur[y * *w + x];
+                if v[3] >= 1.0 {
+                    continue;
+                }
+                let (fx, fy) = (((x as f32 + 0.5) / 2.0 - 0.5).max(0.0), ((y as f32 + 0.5) / 2.0 - 0.5).max(0.0));
+                let (x0, y0) = ((fx as usize).min(cw - 1), (fy as usize).min(ch - 1));
+                let (x1, y1) = ((x0 + 1).min(cw - 1), (y0 + 1).min(ch - 1));
+                let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                let rest = 1.0 - v[3];
+                for c in 0..3 {
+                    let a = up[y0 * cw + x0][c] * (1.0 - tx) + up[y0 * cw + x1][c] * tx;
+                    let b = up[y1 * cw + x0][c] * (1.0 - tx) + up[y1 * cw + x1][c] * tx;
+                    v[c] += rest * (a * (1.0 - ty) + b * ty);
+                }
+                v[3] = 1.0;
+            }
+        }
+    }
+    for (p, v) in px.data.chunks_exact_mut(4).zip(&levels[0].2) {
+        p.copy_from_slice(&[v[0].round() as u8, v[1].round() as u8, v[2].round() as u8, 255]);
+    }
 }
 
 impl Document {

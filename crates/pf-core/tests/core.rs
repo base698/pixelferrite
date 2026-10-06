@@ -567,3 +567,16 @@ fn smart_selection() {
     let loops = segment::contours(&both);
     assert_eq!((loops.len(), loops[0].len(), loops[1].len()), (2, 80, 20));
 }
+
+#[test]
+fn ai_edit_fills_empty_canvas() {
+    use pf_core::aiedit::{Source, prepare};
+    // A red block in the middle of an otherwise empty canvas.
+    let mut doc = Document::new(300, 100, None);
+    doc.add_image_scaled("block", &Pixmap::filled(10, 10, [200, 30, 30, 255]), IRect::new(100, 0, 200, 100));
+    let job = prepare(&doc.state, Source::Visible, |w, h| (w, h)).unwrap();
+    assert!(job.image.data.chunks_exact(4).all(|p| p[3] == 255), "nothing see-through is sent");
+    assert_eq!(job.image.px(150, 50), [200, 30, 30, 255], "what was there is untouched");
+    let edge = job.image.px(5, 50);
+    assert!(edge[0] > 150 && edge[1] < 80, "empty space takes on the nearby colour: {edge:?}");
+}

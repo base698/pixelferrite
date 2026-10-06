@@ -134,7 +134,9 @@ pub fn full_prompt(user: &str, masked: bool) -> String {
     }
     let rules = "Fill in only the masked (transparent) area of the mask. Continue the surrounding picture seamlessly into it: \
                  same art style, colors, lighting and perspective, with lines and objects that reach the edge of the masked area carrying on across it. \
-                 Do not change, restyle or move anything outside the masked area.";
+                 Do not change, restyle or move anything outside the masked area. \
+                 Any blur or flat color inside the masked area is only a placeholder: paint over all of it with finished picture, right up to the edges of the image. \
+                 The result is one continuous picture that fills the whole frame: no black bars, borders, frames, letterboxing or blank areas.";
     if user.is_empty() { format!("{rules} Add nothing new; just extend the existing picture.") } else { format!("{rules} In the masked area: {user}") }
 }
 
