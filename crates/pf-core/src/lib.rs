@@ -8,12 +8,15 @@ pub mod composite;
 pub mod document;
 pub mod fill;
 pub mod filter;
+pub mod fx;
 pub mod geom;
 pub mod io;
 pub mod ops;
 pub mod paint;
+pub mod segment;
 pub mod selection;
 pub mod text;
+pub mod transform;
 
 pub use blend::BlendMode;
 pub use buf::{Buf, Mask, Pixmap};

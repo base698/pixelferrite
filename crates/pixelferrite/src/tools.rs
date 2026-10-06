@@ -13,6 +13,8 @@ pub enum Tool {
     Lasso,
     QuickSelect,
     MagicWand,
+    SubjectSelect,
+    RegionSelect,
     Brush,
     Pencil,
     Eraser,
@@ -28,7 +30,7 @@ pub enum Tool {
 
 impl Tool {
     /// Toolbar order; `None` is a gap between groups.
-    pub const STRIP: [Option<Tool>; 22] = [
+    pub const STRIP: [Option<Tool>; 24] = [
         Some(Tool::Move),
         None,
         Some(Tool::RectSelect),
@@ -36,6 +38,8 @@ impl Tool {
         Some(Tool::Lasso),
         Some(Tool::QuickSelect),
         Some(Tool::MagicWand),
+        Some(Tool::SubjectSelect),
+        Some(Tool::RegionSelect),
         None,
         Some(Tool::Brush),
         Some(Tool::Pencil),
@@ -61,6 +65,8 @@ impl Tool {
             Tool::Lasso => "Free Selection",
             Tool::QuickSelect => "Quick Selection",
             Tool::MagicWand => "Magic Wand",
+            Tool::SubjectSelect => "Select Subject",
+            Tool::RegionSelect => "Region Selection",
             Tool::Brush => "Paint",
             Tool::Pencil => "Pencil",
             Tool::Eraser => "Erase",
@@ -83,6 +89,8 @@ impl Tool {
             Tool::Lasso => icon::LASSO,
             Tool::QuickSelect => icon::SELECTION_PLUS,
             Tool::MagicWand => icon::MAGIC_WAND,
+            Tool::SubjectSelect => icon::USER_FOCUS,
+            Tool::RegionSelect => icon::PUZZLE_PIECE,
             Tool::Brush => icon::PAINT_BRUSH,
             Tool::Pencil => icon::PENCIL_SIMPLE,
             Tool::Eraser => icon::ERASER,
@@ -105,6 +113,8 @@ impl Tool {
             Tool::Lasso => Key::L,
             Tool::QuickSelect => Key::Q,
             Tool::MagicWand => Key::W,
+            Tool::SubjectSelect => Key::U,
+            Tool::RegionSelect => Key::Y,
             Tool::Brush => Key::B,
             Tool::Pencil => Key::N,
             Tool::Eraser => Key::E,
@@ -120,7 +130,10 @@ impl Tool {
     }
 
     pub fn is_selection(self) -> bool {
-        matches!(self, Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso | Tool::QuickSelect | Tool::MagicWand)
+        matches!(
+            self,
+            Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso | Tool::QuickSelect | Tool::MagicWand | Tool::SubjectSelect | Tool::RegionSelect
+        )
     }
 }
 
@@ -144,6 +157,8 @@ pub struct Settings {
     pub gradient_fill: GradientFill,
     pub gradient_opacity: f32,
     pub sel_mode: Combine,
+    /// How fine the regions of the region selection tool are (0..=1).
+    pub region_detail: f32,
     /// Style for new text; `text` and `path` are ignored.
     pub text: TextSpec,
     pub tolerance: u8,
@@ -170,6 +185,7 @@ impl Default for Settings {
             gradient_fill: GradientFill::ForegroundToBackground,
             gradient_opacity: 1.0,
             sel_mode: Combine::Replace,
+            region_detail: 0.5,
             text: TextSpec::default(),
             tolerance: 32,
             contiguous: true,

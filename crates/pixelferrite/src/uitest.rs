@@ -379,3 +379,103 @@ fn edge_detection_and_ai_edit() {
     h.state_mut().open_path(&out.join("does-not-exist.png"));
     assert_eq!(store.recent().len(), 2);
 }
+
+#[test]
+fn smart_select_filters_and_geometry() {
+    use pf_core::filter::Filter;
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/uitest");
+    std::fs::create_dir_all(&out).unwrap();
+    // A photo-like scene: textured backdrop with a distinct red disc.
+    let mut px = Pixmap::new(800, 600);
+    for y in 0..600 {
+        for x in 0..800 {
+            let n = ((x * 37 + y * 91) % 23) as u8;
+            let c: [u8; 3] = if (x - 300) * (x - 300) + (y - 300) * (y - 300) < 120 * 120 { [200, 40, 40] } else { [90 + (x / 16) as u8, 130, 150] };
+            px.set(x, y, [c[0] + n, c[1] + n, c[2] + n, 255]);
+        }
+    }
+    let file = out.join("scene.png");
+    io::export(&Document::from_pixmap(px, "bg").state, &file).unwrap();
+    let mut h = Harness::builder().with_size(vec2(1400.0, 880.0)).wgpu().build_eframe(|cc| App::new(cc, Some(file)));
+    h.run_steps(3);
+    let ctx = h.ctx.clone();
+    let at = |h: &Harness<'_, App>, x: f32, y: f32| h.state().view.to_screen(egui::pos2(x, y));
+    let sel_at = |h: &Harness<'_, App>, x: i32, y: i32| h.state().doc.state.selection.as_ref().map_or(0, |m| m.px(x, y)[0]);
+    let key = |h: &mut Harness<'_, App>, key| {
+        h.event(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+        h.run_steps(2);
+    };
+
+    // Select Subject: a box around the disc selects the disc, not the box.
+    h.state_mut().tool = Tool::SubjectSelect;
+    let (a, b) = (at(&h, 150.0, 150.0), at(&h, 450.0, 450.0));
+    drag(&mut h, &[a, a + (b - a) * 0.5, b]);
+    assert!(sel_at(&h, 300, 300) > 200 && sel_at(&h, 160, 160) < 50 && sel_at(&h, 440, 440) < 50, "the disc, not the box, should be selected");
+    h.run_steps(2);
+    h.render().unwrap().save(out.join("subject.png")).unwrap();
+
+    // Heal Selection needs that selection, and removes the disc.
+    h.state_mut().run(&ctx, Action::OpenFilter(Filter::Inpaint { radius: 8.0 }));
+    h.run_steps(2);
+    assert!(h.state().filter.is_some());
+    key(&mut h, egui::Key::Enter);
+    let healed = pf_core::composite::sample(&h.state().doc.state, 300, 300).unwrap();
+    assert!(healed[0] < 170 && healed[2] > 120, "disc should be filled with backdrop: {healed:?}");
+    h.state_mut().run(&ctx, Action::Undo);
+    h.state_mut().run(&ctx, Action::Deselect);
+    h.state_mut().run(&ctx, Action::OpenFilter(Filter::Inpaint { radius: 8.0 }));
+    assert!(h.state().filter.is_none(), "without a selection it only explains what to do");
+
+    // Region selection: a click on the disc takes the disc.
+    h.state_mut().tool = Tool::RegionSelect;
+    h.state_mut().settings.region_detail = 0.2;
+    let centre = at(&h, 300.0, 300.0);
+    drag(&mut h, &[centre]);
+    assert!(sel_at(&h, 300, 300) == 255 && sel_at(&h, 60, 60) == 0, "the region under the click is selected");
+    let (names, _) = h.state().doc.history();
+    assert_eq!(names.last(), Some("Region Selection"));
+
+    // Its outline becomes a path for text.
+    let n = h.state().doc.state.layers.len();
+    h.state_mut().run(&ctx, Action::SelectionToTextPath);
+    h.run_steps(2);
+    let st = &h.state().doc.state;
+    let t = st.active_layer().unwrap().text.clone().expect("a text layer following the outline");
+    assert!(st.layers.len() == n + 1 && t.path.len() > 8);
+    h.event(Event::Text("around and around the red disc goes the text ".into()));
+    h.run_steps(3);
+    h.render().unwrap().save(out.join("text-outline.png")).unwrap();
+    h.state_mut().run(&ctx, Action::DeleteLayer);
+    h.state_mut().run(&ctx, Action::Deselect);
+
+    // A tone filter through its dialog.
+    h.state_mut().tool = Tool::Move;
+    h.state_mut().run(&ctx, Action::OpenFilter(Filter::LocalContrast { clip: 3.0, tiles: 8 }));
+    h.run_steps(2);
+    h.render().unwrap().save(out.join("local-contrast.png")).unwrap();
+    key(&mut h, egui::Key::Enter);
+    assert_eq!(h.state().doc.history().0.last(), Some("Local Contrast"));
+
+    // Perspective: drag the top-right handle inwards, then apply.
+    h.state_mut().run(&ctx, Action::Perspective);
+    h.run_steps(2);
+    assert!(h.state().warp.is_some());
+    let (from, to) = (at(&h, 800.0, 0.0), at(&h, 700.0, 120.0));
+    drag(&mut h, &[from, from + (to - from) * 0.5, to]);
+    assert_eq!(pf_core::composite::sample(&h.state().doc.state, 780, 20).unwrap()[3], 0, "the pulled-in corner leaves the canvas showing");
+    h.run_steps(2);
+    h.render().unwrap().save(out.join("perspective.png")).unwrap();
+    key(&mut h, egui::Key::Enter);
+    assert!(h.state().warp.is_none());
+    assert_eq!(h.state().doc.history().0.last(), Some("Perspective"));
+    h.state_mut().run(&ctx, Action::Undo);
+
+    // Content-aware scale shrinks the image and the canvas with it.
+    h.state_mut().run(&ctx, Action::ContentAwareScale);
+    h.run_steps(2);
+    assert!(h.state().scale_dlg.is_some());
+    h.render().unwrap().save(out.join("content-scale.png")).unwrap();
+    key(&mut h, egui::Key::Escape);
+    assert!(h.state_mut().doc.content_aware_scale(700, 600));
+    assert_eq!(h.state().doc.state.width, 700);
+}

@@ -5,9 +5,10 @@ use std::sync::Arc;
 use egui::{Color32, CursorIcon, Mesh, Modifiers, PointerButton, Pos2, Rect, Sense, Shape, Stroke as Line, Ui, Vec2, pos2};
 use pf_core::fill::{self, GradientOp, GradientParams};
 use pf_core::paint::{PaintKind, Stroke};
+use pf_core::segment;
 use pf_core::selection::{self, Combine};
 use pf_core::text;
-use pf_core::{DocState, IRect, Pixmap, composite};
+use pf_core::{DocState, IRect, Mask, Pixmap, composite};
 
 use crate::app::App;
 use crate::tools::{GradientFill, Tool};
@@ -25,6 +26,10 @@ pub enum Drag {
     Marquee { start: Pos2, cur: Pos2, mode: Combine, ellipse: bool },
     Lasso { pts: Vec<Pos2>, mode: Combine },
     Quick { before: DocState, src: Pixmap, mode: Combine, last: Pos2 },
+    /// Select Subject: a box around the thing to cut out.
+    Subject { start: Pos2, cur: Pos2, mode: Combine },
+    /// Region selection: the regions swept over so far.
+    Region { before: DocState, mode: Combine, labels: Vec<u32>, base: Option<Arc<Mask>> },
     /// Type tool: a click places text, a drag draws a path for it.
     TextPath { pts: Vec<Pos2> },
 }
@@ -120,7 +125,7 @@ pub fn canvas(app: &mut App, ui: &mut Ui) {
     if matches!(app.drag, Drag::None) && on_canvas {
         if inp.mid_pressed || (inp.pressed && (inp.space || app.tool == Tool::Hand)) {
             app.drag = Drag::Pan;
-        } else if inp.pressed && app.filter.is_none() {
+        } else if inp.pressed && !app.busy() {
             if let Some(p) = inp.pos {
                 press(app, app.view.to_doc(p), inp.mods);
             }
@@ -140,6 +145,29 @@ pub fn canvas(app: &mut App, ui: &mut Ui) {
     }
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         cancel(app);
+    }
+
+    // Perspective: drag the nearest corner handle.
+    let mut warped = false;
+    if let (Some(w), Some(pos)) = (&mut app.warp, inp.pos) {
+        if inp.pressed && on_canvas && !inp.space {
+            let dist = |i: usize| (app.view.to_screen(pos2(w.quad[i].0, w.quad[i].1)) - pos).length();
+            let i = (0..4).min_by(|a, b| dist(*a).total_cmp(&dist(*b))).unwrap();
+            w.grab = (dist(i) < 16.0).then_some(i);
+        }
+        match w.grab {
+            Some(i) if inp.down => {
+                let d = app.view.to_doc(pos);
+                if w.quad[i] != (d.x, d.y) {
+                    w.quad[i] = (d.x, d.y);
+                    warped = true;
+                }
+            }
+            _ => w.grab = None,
+        }
+    }
+    if warped {
+        app.warp_changed();
     }
 
     // ---- draw ----
@@ -190,6 +218,16 @@ pub fn canvas(app: &mut App, ui: &mut Ui) {
         }
     }
 
+    if let Some(w) = &app.warp {
+        let pts: Vec<Pos2> = w.quad.iter().map(|p| app.view.to_screen(pos2(p.0, p.1))).collect();
+        painter.add(Shape::closed_line(pts.clone(), Line::new(3.0, Color32::from_black_alpha(140))));
+        painter.add(Shape::closed_line(pts.clone(), Line::new(1.5, ACCENT)));
+        for (i, p) in pts.iter().enumerate() {
+            let r = if w.grab == Some(i) { 7.0 } else { 5.5 };
+            painter.circle(*p, r, Color32::WHITE, Line::new(2.0, ACCENT));
+        }
+    }
+
     // In-progress shapes.
     let contrast = |painter: &egui::Painter, pts: Vec<Pos2>, closed: bool| {
         for (wd, col) in [(2.5, Color32::from_black_alpha(160)), (1.0, Color32::WHITE)] {
@@ -212,6 +250,7 @@ pub fn canvas(app: &mut App, ui: &mut Ui) {
             };
             contrast(&painter, pts, true);
         }
+        Drag::Subject { start, cur, .. } => contrast(&painter, quad(Rect::from_two_pos(*start, *cur), &app.view), true),
         Drag::Lasso { pts, .. } | Drag::TextPath { pts } => {
             contrast(&painter, pts.iter().map(|p| app.view.to_screen(*p)).collect(), false);
         }
@@ -311,6 +350,32 @@ fn quick_step(app: &mut App, p: Pos2) {
     app.doc.state.selection = sel.map(Arc::new);
 }
 
+/// Identifies the picture the region map was computed from.
+fn region_key(app: &App) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let st = &app.doc.state;
+    (st.width, st.height, st.active, app.settings.sample_all_layers, app.settings.region_detail.to_bits()).hash(&mut h);
+    for l in &st.layers {
+        (l.id, l.rev, l.visible, l.x, l.y, l.opacity.to_bits(), l.mask_enabled).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Add the region under `p` to the ones swept so far and update the selection.
+fn region_step(app: &mut App, p: Pos2) {
+    let (w, h) = (app.doc.state.width, app.doc.state.height);
+    let (Drag::Region { mode, labels, base, .. }, Some((_, regions))) = (&mut app.drag, &app.regions) else { return };
+    let Some(label) = regions.label_at(p.x, p.y) else { return };
+    if labels.contains(&label) {
+        return;
+    }
+    labels.push(label);
+    let swept = regions.mask(labels, w, h);
+    let how = if *mode == Combine::Replace { Combine::Add } else { *mode };
+    app.doc.state.selection = selection::combine(base.as_deref(), &swept, how).map(Arc::new);
+}
+
 fn press(app: &mut App, p: Pos2, mods: Modifiers) {
     let tool = app.tool;
     let pt = (p.x, p.y);
@@ -383,6 +448,19 @@ fn press(app: &mut App, p: Pos2, mods: Modifiers) {
         }
         Tool::Lasso => app.drag = Drag::Lasso { pts: vec![p], mode: combine_mode(mods, app.settings.sel_mode) },
         Tool::Text => app.drag = Drag::TextPath { pts: vec![p] },
+        Tool::SubjectSelect => app.drag = Drag::Subject { start: p, cur: p, mode: combine_mode(mods, app.settings.sel_mode) },
+        Tool::RegionSelect => {
+            let key = region_key(app);
+            if app.regions.as_ref().is_none_or(|(k, _)| *k != key) {
+                let Some(src) = fill::sample_source(&app.doc.state, app.settings.sample_all_layers) else { return };
+                app.regions = Some((key, segment::watershed(&src, app.settings.region_detail)));
+            }
+            let mode = combine_mode(mods, app.settings.sel_mode);
+            let before = app.doc.begin();
+            let base = if mode == Combine::Replace { None } else { before.selection.clone() };
+            app.drag = Drag::Region { before, mode, labels: Vec::new(), base };
+            region_step(app, p);
+        }
         Tool::MagicWand => {
             let s = &app.settings;
             let seed = ipos(p);
@@ -462,6 +540,8 @@ fn dragged(app: &mut App, p: Pos2, screen: Pos2, inp: &Input) {
                 pts.push(p);
             }
         }
+        Drag::Subject { cur, .. } => *cur = p,
+        Drag::Region { .. } => region_step(app, p),
         Drag::Quick { last, .. } => {
             if (*last - p).length() >= (app.settings.quick_size * 0.25).max(1.0) {
                 *last = p;
@@ -521,6 +601,22 @@ fn release(app: &mut App) {
             let pts: Vec<(f32, f32)> = pts.iter().map(|p| (p.x, p.y)).collect();
             app.doc.select("Free Selection", &selection::polygon_mask(w, h, &pts), mode);
         }
+        Drag::Subject { start, cur, mode } => {
+            let r = Rect::from_two_pos(start, cur);
+            if r.width() < 4.0 || r.height() < 4.0 {
+                if mode == Combine::Replace {
+                    app.doc.deselect();
+                }
+                return;
+            }
+            let Some(src) = fill::sample_source(&app.doc.state, app.settings.sample_all_layers) else { return };
+            let found = segment::grabcut(&src, IRect::enclosing(r.min.x, r.min.y, r.max.x, r.max.y));
+            if selection::bounds(&found).is_none() {
+                return app.toast("Couldn't tell a subject from its background there. Try a tighter box.");
+            }
+            app.doc.select("Select Subject", &found, mode);
+        }
+        Drag::Region { before, .. } => app.doc.commit_quiet("Region Selection", before),
         Drag::TextPath { pts } => {
             let len: f32 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
             let repath = std::mem::take(&mut app.text_repath);
@@ -566,7 +662,7 @@ fn release(app: &mut App) {
 pub fn cancel(app: &mut App) {
     match std::mem::replace(&mut app.drag, Drag::None) {
         Drag::Gradient { op, .. } => op.cancel(&mut app.doc),
-        Drag::Move { before, .. } | Drag::Quick { before, .. } => {
+        Drag::Move { before, .. } | Drag::Quick { before, .. } | Drag::Region { before, .. } => {
             app.doc.state = before;
             app.doc.mark_all_dirty();
         }

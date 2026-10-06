@@ -242,9 +242,11 @@ pub fn smooth_path(pts: &[(f32, f32)], tolerance: f32) -> Vec<(f32, f32)> {
     while let Some((a, b)) = stack.pop() {
         let (pa, pb) = (pts[a], pts[b]);
         let (dx, dy) = (pb.0 - pa.0, pb.1 - pa.1);
-        let len = dx.hypot(dy).max(1e-6);
+        let len = dx.hypot(dy);
+        // For a closed loop the ends coincide: measure from that point instead of a line.
+        let off = |p: (f32, f32)| if len > 1e-3 { ((p.0 - pa.0) * dy - (p.1 - pa.1) * dx).abs() / len } else { (p.0 - pa.0).hypot(p.1 - pa.1) };
         let far = (a + 1..b)
-            .map(|i| (i, ((pts[i].0 - pa.0) * dy - (pts[i].1 - pa.1) * dx).abs() / len))
+            .map(|i| (i, off(pts[i])))
             .max_by(|x, y| x.1.total_cmp(&y.1));
         if let Some((i, d)) = far {
             if d > tolerance {

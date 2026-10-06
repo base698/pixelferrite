@@ -3,6 +3,7 @@ mod aiui;
 mod app;
 mod canvas;
 mod fonts;
+mod fxui;
 mod panels;
 mod store;
 mod tools;

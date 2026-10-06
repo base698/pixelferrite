@@ -3,6 +3,7 @@
 use egui::{Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 use egui_phosphor::regular as icon;
 use pf_core::fill::GradientShape;
+use pf_core::filter::Filter;
 use pf_core::ops::Reorder;
 use pf_core::selection::Combine;
 use pf_core::text::{Align as TextAlign, TextSpec};
@@ -108,10 +109,37 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
             item(app, ui, "All", &cmd("A"), Action::SelectAll);
             item(app, ui, "Deselect", &cmd("D"), Action::Deselect);
             item(app, ui, "Invert", &cmd("⇧I"), Action::InvertSelection);
+            ui.separator();
+            item(app, ui, "Selection Outline to Text Path", "", Action::SelectionToTextPath);
         });
         ui.menu_button("Filter", |ui| {
-            item(app, ui, "Gaussian Blur…", "", Action::GaussianBlur);
-            item(app, ui, "Edge Detection…", "", Action::EdgeDetect);
+            ui.menu_button("Blur & Sharpen", |ui| {
+                item(app, ui, "Gaussian Blur…", "", Action::GaussianBlur);
+                item(app, ui, "Surface Blur…", "", Action::OpenFilter(Filter::SurfaceBlur { radius: 4.0, tolerance: 25.0 }));
+                item(app, ui, "Sharpen…", "", Action::OpenFilter(Filter::UnsharpMask { radius: 1.5, amount: 1.0, threshold: 0.0 }));
+            });
+            ui.menu_button("Repair", |ui| {
+                item(app, ui, "Heal Selection…", "", Action::OpenFilter(Filter::Inpaint { radius: 6.0 }));
+                item(app, ui, "Reduce Noise…", "", Action::OpenFilter(Filter::Denoise { strength: 12.0 }));
+            });
+            ui.menu_button("Tone & Color", |ui| {
+                item(app, ui, "Auto Contrast…", "", Action::OpenFilter(Filter::AutoContrast { clip: 0.5 }));
+                item(app, ui, "Equalize…", "", Action::OpenFilter(Filter::Equalize { amount: 1.0 }));
+                item(app, ui, "Local Contrast…", "", Action::OpenFilter(Filter::LocalContrast { clip: 2.5, tiles: 8 }));
+                ui.separator();
+                item(app, ui, "Threshold…", "", Action::OpenFilter(Filter::Threshold { level: 128.0 }));
+                item(app, ui, "Adaptive Threshold…", "", Action::OpenFilter(Filter::AdaptiveThreshold { radius: 20.0, offset: 6.0 }));
+                ui.separator();
+                item(app, ui, "Match Colors…", "", Action::OpenFilter(Filter::MatchColors { mean: [0.0; 3], dev: [0.0; 3], amount: 1.0 }));
+            });
+            ui.menu_button("Geometry", |ui| {
+                item(app, ui, "Perspective…", "", Action::Perspective);
+                item(app, ui, "Lens Distortion…", "", Action::OpenFilter(Filter::LensDistortion { amount: 0.15 }));
+                item(app, ui, "Content-Aware Scale…", "", Action::ContentAwareScale);
+            });
+            ui.menu_button("Stylize", |ui| {
+                item(app, ui, "Edge Detection…", "", Action::EdgeDetect);
+            });
         });
         ui.menu_button("View", |ui| {
             item(app, ui, "Zoom In", &cmd("+"), Action::ZoomIn);
@@ -180,7 +208,7 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
 }
 
 pub fn tool_strip(app: &mut App, ui: &mut Ui) {
-    if app.filter.is_some() {
+    if app.busy() {
         ui.disable();
     }
     ui.vertical_centered(|ui| {
@@ -358,7 +386,7 @@ fn text_options(app: &mut App, ui: &mut Ui, full: f32) {
 }
 
 pub fn inspector(app: &mut App, ui: &mut Ui) {
-    if app.filter.is_some() {
+    if app.busy() {
         ui.disable();
     }
     let ctx = ui.ctx().clone();
@@ -496,6 +524,17 @@ pub fn inspector(app: &mut App, ui: &mut Ui) {
             ui.add_space(8.0);
             ui.label(RichText::new("Drag on the image to draw the gradient.").color(DIM).small());
         }
+        Tool::SubjectSelect => {
+            ui.label(RichText::new("Drag a box around a subject. Everything outside the box is treated as background, and the subject inside is separated from it by color and edges.").color(DIM));
+            ui.add_space(4.0);
+            ui.checkbox(&mut app.settings.sample_all_layers, "Look at all layers");
+        }
+        Tool::RegionSelect => {
+            ui.label(RichText::new("Click an area to select it up to its edges; drag to sweep up several.").color(DIM));
+            ui.add_space(4.0);
+            percent(ui, "Detail", &mut app.settings.region_detail).on_hover_text("Higher splits the picture into smaller regions");
+            ui.checkbox(&mut app.settings.sample_all_layers, "Look at all layers");
+        }
         Tool::Bucket | Tool::MagicWand | Tool::QuickSelect => {
             let s = &mut app.settings;
             if tool == Tool::QuickSelect {
@@ -596,7 +635,7 @@ enum RowAct {
 }
 
 pub fn layers(app: &mut App, ui: &mut Ui) {
-    if app.filter.is_some() {
+    if app.busy() {
         ui.disable();
     }
     let ctx = ui.ctx().clone();

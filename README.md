@@ -43,11 +43,24 @@ limited to the selection if there is one. To add one, add a variant to
 `Filter` in `crates/pf-core/src/filter.rs` and its controls to
 `App::filter_dialog`.
 
-- **Gaussian Blur**
-- **Edge Detection** — Canny edge detection (the same algorithm as OpenCV's
-  `Canny`, implemented here so there is no native library to install). Draws
-  the edges as lines on white or black, or highlights them over the image;
-  "Select Edges Instead" turns them into a selection.
+| Filter > | |
+|---|---|
+| Blur & Sharpen | Gaussian Blur, Surface Blur (bilateral: smooths but keeps edges), Sharpen (unsharp mask) |
+| Repair | Heal Selection (fills the selection from its surroundings), Reduce Noise (non-local means) |
+| Tone & Color | Auto Contrast, Equalize, Local Contrast (CLAHE), Threshold, Adaptive Threshold, Match Colors (to another layer or an image file) |
+| Geometry | Perspective (drag four corners to distort, or mark a skewed rectangle to straighten it), Lens Distortion, Content-Aware Scale (seam carving; shrink only) |
+| Stylize | Edge Detection (Canny; lines, highlight, or "Select Edges Instead") |
+
+These are native Rust implementations of the classic OpenCV algorithms, so
+there is no native library to install.
+
+## Smart selection
+
+- **Select Subject** (U): drag a box around something; GrabCut separates it
+  from the background inside the box.
+- **Region Selection** (Y): click an area to select it up to its edges
+  (watershed); drag to sweep up several. "Detail" sets how fine the regions are.
+- **Select > Selection Outline to Text Path**: text runs around the selection.
 
 ## AI edits
 
@@ -120,5 +133,5 @@ keep_history = 200  # AI requests to keep
 | Alt-click (brush, pencil) | Pick color |
 
 Tool keys: V arrange, M / O / L rectangle, ellipse and free selection, Q quick
-selection, W magic wand, B brush, N pencil, E eraser, G gradient, K fill,
+selection, W magic wand, U select subject, Y region selection, B brush, N pencil, E eraser, G gradient, K fill,
 S clone stamp, R smudge, T type, I color picker, H hand, Z zoom.

@@ -10,6 +10,7 @@ use pf_core::{DocState, Document, Layer, LayerId, io};
 use crate::aiui::AiUi;
 use crate::canvas::{self, Ants, Drag};
 use crate::fonts::Fonts;
+use crate::fxui::{ScaleDlg, Warp};
 use crate::store::{Settings as Saved, Store};
 use crate::panels;
 use crate::tools::{Settings, Tool};
@@ -58,16 +59,30 @@ pub enum Action {
     ResetRotation,
     GaussianBlur,
     EdgeDetect,
+    OpenFilter(Filter),
+    Perspective,
+    ContentAwareScale,
+    SelectionToTextPath,
     AiPrompt,
     AiHistory,
     Settings,
     ClearRecent,
 }
 
+/// A labelled slider for a filter parameter; `log` suits sizes in pixels.
+/// Returns whether the value changed.
+fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, log: bool, suffix: &str, tip: &str) -> bool {
+    ui.label(label);
+    let r = ui.add(egui::Slider::new(v, range).logarithmic(log).suffix(suffix).max_decimals(2));
+    if tip.is_empty() { r.changed() } else { r.on_hover_text(tip).changed() }
+}
+
 /// A filter being previewed in its dialog.
 pub struct FilterDlg {
     op: FilterOp,
     filter: Filter,
+    /// Parameters changed since the preview was last rendered.
+    pending: bool,
 }
 
 pub struct Thumb {
@@ -115,6 +130,10 @@ pub struct App {
     pub text_repath: bool,
     text_ctx: (Tool, LayerId),
     pub filter: Option<FilterDlg>,
+    pub warp: Option<Warp>,
+    pub scale_dlg: Option<ScaleDlg>,
+    /// Cached edge-bounded regions for the region selection tool.
+    pub regions: Option<(u64, pf_core::segment::Regions)>,
     pub ai: AiUi,
     pub ctx: Context,
     pub store: Store,
@@ -166,6 +185,9 @@ impl App {
             text_repath: false,
             text_ctx: (Tool::Brush, 0),
             filter: None,
+            warp: None,
+            scale_dlg: None,
+            regions: None,
             ai: AiUi::default(),
             ctx: cc.egui_ctx.clone(),
             store: store.clone(),
@@ -211,6 +233,9 @@ impl App {
         self.prop = None;
         self.rename = None;
         self.filter = None;
+        self.warp = None;
+        self.scale_dlg = None;
+        self.regions = None;
         self.ai.document_changed();
     }
 
@@ -235,11 +260,26 @@ impl App {
         self.text_focus = Some(true);
     }
 
-    fn open_filter(&mut self, filter: Filter) {
+    /// A filter dialog or on-canvas operation owns the image for now.
+    pub fn busy(&self) -> bool {
+        self.filter.is_some() || self.warp.is_some()
+    }
+
+    fn open_filter(&mut self, mut filter: Filter) {
+        if filter.needs_selection() && self.doc.state.selection.is_none() {
+            return self.toast("Select what to remove first, then use this to fill it in from its surroundings");
+        }
+        if let Filter::MatchColors { mean, dev, .. } = &mut filter {
+            // Start from another layer's colours if there is one.
+            let other = self.doc.state.layers.iter().rev().find(|l| l.id != self.doc.state.active && l.visible);
+            if let Some(stats) = other.and_then(|l| pf_core::fx::color_stats(&l.pixels)) {
+                (*mean, *dev) = stats;
+            }
+        }
         match FilterOp::begin(&self.doc) {
             Some(mut op) => {
                 op.update(&mut self.doc, &filter);
-                self.filter = Some(FilterDlg { op, filter });
+                self.filter = Some(FilterDlg { op, filter, pending: false });
             }
             None => self.toast("This layer is hidden or locked"),
         }
@@ -284,6 +324,68 @@ impl App {
                             select = true;
                         }
                     }
+                    Filter::UnsharpMask { radius, amount, threshold } => {
+                        changed |= slider(ui, "Amount", amount, 0.0..=5.0, false, "", "");
+                        changed |= slider(ui, "Radius", radius, 0.2..=50.0, true, " px", "");
+                        changed |= slider(ui, "Threshold", threshold, 0.0..=50.0, false, "", "Ignore differences smaller than this, so noise isn't sharpened");
+                    }
+                    Filter::SurfaceBlur { radius, tolerance } => {
+                        changed |= slider(ui, "Radius", radius, 0.5..=20.0, true, " px", "");
+                        changed |= slider(ui, "Edge tolerance", tolerance, 2.0..=120.0, true, "", "Colour differences above this are kept as edges");
+                    }
+                    Filter::Denoise { strength } => {
+                        changed |= slider(ui, "Strength", strength, 1.0..=80.0, true, "", "");
+                    }
+                    Filter::Inpaint { radius } => {
+                        changed |= slider(ui, "Sample radius", radius, 2.0..=24.0, false, " px", "");
+                        ui.label(egui::RichText::new("Fills the selection from the pixels around it. Best for small things on plain or softly textured backgrounds; use Send to AI for big or detailed areas.").small().weak());
+                    }
+                    Filter::AutoContrast { clip } => {
+                        changed |= slider(ui, "Clip", clip, 0.0..=5.0, false, " %", "Share of the darkest and lightest pixels allowed to go pure black / white");
+                    }
+                    Filter::Equalize { amount } => {
+                        changed |= slider(ui, "Amount", amount, 0.0..=1.0, false, "", "");
+                    }
+                    Filter::LocalContrast { clip, tiles } => {
+                        changed |= slider(ui, "Strength", clip, 1.0..=8.0, false, "", "");
+                        ui.label("Grid");
+                        changed |= ui.add(egui::Slider::new(tiles, 2..=16)).on_hover_text("More tiles adapts to smaller areas").changed();
+                    }
+                    Filter::Threshold { level } => {
+                        changed |= slider(ui, "Level", level, 1.0..=254.0, false, "", "");
+                    }
+                    Filter::AdaptiveThreshold { radius, offset } => {
+                        changed |= slider(ui, "Neighbourhood", radius, 2.0..=100.0, true, " px", "");
+                        changed |= slider(ui, "Offset", offset, -40.0..=40.0, false, "", "Higher turns more of the picture white");
+                    }
+                    Filter::MatchColors { mean, dev, amount } => {
+                        ui.label("Take colors from");
+                        let active = self.doc.state.active;
+                        ui.horizontal_wrapped(|ui| {
+                            for l in self.doc.state.layers.iter().rev().filter(|l| l.id != active) {
+                                if ui.button(&l.name).clicked() {
+                                    if let Some(s) = pf_core::fx::color_stats(&l.pixels) {
+                                        (*mean, *dev) = s;
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            if ui.button("Image file…").clicked() {
+                                let exts: Vec<&str> = io::OPEN_EXTENSIONS.iter().copied().filter(|e| *e != "ora").collect();
+                                if let Some(s) = rfd::FileDialog::new().add_filter("Images", &exts).pick_file().and_then(|p| io::load_pixmap(&p).ok()).and_then(|px| pf_core::fx::color_stats(&px)) {
+                                    (*mean, *dev) = s;
+                                    changed = true;
+                                }
+                            }
+                        });
+                        if *dev == [0.0; 3] {
+                            ui.label(egui::RichText::new("Pick a layer or an image whose colors this layer should take on.").small().weak());
+                        }
+                        changed |= slider(ui, "Amount", amount, 0.0..=1.0, false, "", "");
+                    }
+                    Filter::LensDistortion { amount } => {
+                        changed |= slider(ui, "Amount", amount, -0.6..=0.6, false, "", "Right straightens lines that bulge outwards, left ones that bow inwards");
+                    }
                 }
                 let scope = if self.doc.state.selection.is_some() { "the selection on" } else { "all of" };
                 let what = if self.doc.effective_target() == pf_core::Target::Mask { "mask" } else { "layer" };
@@ -308,8 +410,13 @@ impl App {
         } else if apply {
             let d = self.filter.take().unwrap();
             d.op.finish(&mut self.doc, &d.filter);
-        } else if changed {
-            d.op.update(&mut self.doc, &d.filter);
+        } else {
+            d.pending |= changed;
+            // Slow filters wait for the slider to be let go.
+            if d.pending && (!d.filter.slow() || !ctx.input(|i| i.pointer.any_down())) {
+                d.pending = false;
+                d.op.update(&mut self.doc, &d.filter);
+            }
         }
     }
 
@@ -345,7 +452,7 @@ impl App {
 
     /// Open a file from the recent list, after the usual unsaved-changes check.
     pub fn open_recent(&mut self, path: &Path) {
-        if matches!(self.drag, Drag::None) && self.filter.is_none() && self.confirm_discard() {
+        if matches!(self.drag, Drag::None) && !self.busy() && self.confirm_discard() {
             self.open_path(path);
         }
     }
@@ -423,7 +530,7 @@ impl App {
         }
         // While a filter is being previewed only the view may change.
         let view = matches!(a, Action::ZoomIn | Action::ZoomOut | Action::ZoomFit | Action::Zoom100 | Action::ResetRotation);
-        if self.filter.is_some() && !view {
+        if self.busy() && !view {
             return;
         }
         let active = self.doc.state.active;
@@ -516,6 +623,10 @@ impl App {
             }
             Action::GaussianBlur => self.open_filter(Filter::GaussianBlur { radius: 8.0 }),
             Action::EdgeDetect => self.open_filter(Filter::EdgeDetect(EdgeParams::default())),
+            Action::OpenFilter(f) => self.open_filter(f),
+            Action::Perspective => self.open_perspective(),
+            Action::ContentAwareScale => self.open_content_scale(),
+            Action::SelectionToTextPath => self.selection_to_text_path(),
             Action::AiPrompt => self.open_ai_prompt(),
             Action::AiHistory => self.open_ai_history(),
             Action::Settings => self.open_settings(),
@@ -563,7 +674,7 @@ impl App {
                 self.run(ctx, a);
             }
         }
-        if self.filter.is_some() {
+        if self.busy() {
             return;
         }
         let events = ctx.input(|i| i.events.clone());
@@ -701,7 +812,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.now = ctx.input(|i| i.time);
 
-        if self.new_doc.is_none() && !self.ai.modal_open() {
+        if self.new_doc.is_none() && self.scale_dlg.is_none() && !self.ai.modal_open() {
             self.shortcuts(&ctx);
         }
         // Switching tool or layer ends the current run of text edits.
@@ -771,6 +882,8 @@ impl eframe::App for App {
 
         self.new_doc_dialog(&ctx);
         self.filter_dialog(&ctx);
+        self.perspective_dialog(&ctx);
+        self.content_scale_dialog(&ctx);
         self.ai_dialogs(&ctx);
 
         if let Some((msg, until)) = &self.toast {

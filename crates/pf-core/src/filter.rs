@@ -11,6 +11,7 @@ use rayon::prelude::*;
 
 use crate::buf::{Buf, Mask};
 use crate::document::{DocState, Document, LayerId, Target};
+use crate::fx;
 use crate::geom::IRect;
 use crate::selection;
 
@@ -50,6 +51,24 @@ pub enum Filter {
     GaussianBlur { radius: f32 },
     /// Canny edge detection, drawn as lines or highlights.
     EdgeDetect(EdgeParams),
+    /// Sharpen by exaggerating the difference from a blurred copy.
+    UnsharpMask { radius: f32, amount: f32, threshold: f32 },
+    /// Edge-preserving (bilateral) smoothing.
+    SurfaceBlur { radius: f32, tolerance: f32 },
+    /// Non-local-means noise removal.
+    Denoise { strength: f32 },
+    /// Fill the selection from its surroundings. Needs a selection.
+    Inpaint { radius: f32 },
+    /// Stretch the tonal range, clipping `clip` percent at each end.
+    AutoContrast { clip: f32 },
+    Equalize { amount: f32 },
+    /// CLAHE: contrast-limited equalisation in a `tiles` x `tiles` grid.
+    LocalContrast { clip: f32, tiles: u32 },
+    Threshold { level: f32 },
+    AdaptiveThreshold { radius: f32, offset: f32 },
+    /// Move colour statistics towards a reference (see [`fx::color_stats`]).
+    MatchColors { mean: [f32; 3], dev: [f32; 3], amount: f32 },
+    LensDistortion { amount: f32 },
 }
 
 impl Filter {
@@ -57,7 +76,28 @@ impl Filter {
         match self {
             Filter::GaussianBlur { .. } => "Gaussian Blur",
             Filter::EdgeDetect(_) => "Edge Detection",
+            Filter::UnsharpMask { .. } => "Sharpen",
+            Filter::SurfaceBlur { .. } => "Surface Blur",
+            Filter::Denoise { .. } => "Reduce Noise",
+            Filter::Inpaint { .. } => "Heal Selection",
+            Filter::AutoContrast { .. } => "Auto Contrast",
+            Filter::Equalize { .. } => "Equalize",
+            Filter::LocalContrast { .. } => "Local Contrast",
+            Filter::Threshold { .. } => "Threshold",
+            Filter::AdaptiveThreshold { .. } => "Adaptive Threshold",
+            Filter::MatchColors { .. } => "Match Colors",
+            Filter::LensDistortion { .. } => "Lens Distortion",
         }
+    }
+
+    /// The filter only makes sense with something selected.
+    pub fn needs_selection(&self) -> bool {
+        matches!(self, Filter::Inpaint { .. })
+    }
+
+    /// Too slow to re-run on every slider movement on a large image.
+    pub fn slow(&self) -> bool {
+        matches!(self, Filter::Denoise { .. } | Filter::SurfaceBlur { .. } | Filter::Inpaint { .. })
     }
 
     /// How far (in pixels) the filter reads from and spreads into its surroundings.
@@ -65,14 +105,33 @@ impl Filter {
         match self {
             Filter::GaussianBlur { radius } => (radius.max(0.0) * 3.0).ceil() as i32 + 1,
             Filter::EdgeDetect(p) => (p.smoothing.max(0.0) * 3.0 + p.thickness).ceil() as i32 + 4,
+            Filter::UnsharpMask { radius, .. } => (radius.max(0.0) * 3.0).ceil() as i32 + 1,
+            Filter::SurfaceBlur { radius, .. } => (radius.max(0.0) * 2.0).ceil() as i32 + 1,
+            Filter::Denoise { .. } => 6,
+            Filter::Inpaint { radius } => radius.ceil() as i32 + 2,
+            Filter::AdaptiveThreshold { radius, .. } => (radius.max(0.0) * 3.0).ceil() as i32 + 1,
+            // These read statistics of exactly the area they change.
+            Filter::AutoContrast { .. } | Filter::Equalize { .. } | Filter::LocalContrast { .. } | Filter::Threshold { .. } | Filter::MatchColors { .. } | Filter::LensDistortion { .. } => 0,
         }
     }
 
     /// Filter `C` interleaved channels of a `w` x `h` float image in place.
-    fn run<const C: usize>(&self, data: &mut Vec<f32>, w: usize, h: usize) {
+    /// `sel` is the selection weight (0..=1) per pixel, if there is one.
+    fn run<const C: usize>(&self, data: &mut Vec<f32>, w: usize, h: usize, sel: Option<&[f32]>) {
         match self {
             Filter::GaussianBlur { radius } => gaussian_blur::<C>(data, w, h, *radius),
             Filter::EdgeDetect(p) => draw_edges::<C>(data, w, h, p),
+            Filter::UnsharpMask { radius, amount, threshold } => fx::unsharp_mask::<C>(data, w, h, *radius, *amount, *threshold),
+            Filter::SurfaceBlur { radius, tolerance } => fx::surface_blur::<C>(data, w, h, *radius, *tolerance),
+            Filter::Denoise { strength } => fx::denoise::<C>(data, w, h, *strength),
+            Filter::Inpaint { radius } => fx::inpaint::<C>(data, w, h, *radius, sel),
+            Filter::AutoContrast { clip } => fx::auto_contrast::<C>(data, *clip),
+            Filter::Equalize { amount } => fx::equalize::<C>(data, *amount),
+            Filter::LocalContrast { clip, tiles } => fx::local_contrast::<C>(data, w, h, *clip, *tiles),
+            Filter::Threshold { level } => fx::threshold::<C>(data, *level),
+            Filter::AdaptiveThreshold { radius, offset } => fx::adaptive_threshold::<C>(data, w, h, *radius, *offset),
+            Filter::MatchColors { mean, dev, amount } => fx::match_colors::<C>(data, *mean, *dev, *amount),
+            Filter::LensDistortion { amount } => fx::lens_distortion::<C>(data, w, h, *amount),
         }
     }
 }
@@ -213,7 +272,10 @@ fn apply<const C: usize>(
             }
         }
     });
-    f.run::<C>(&mut data, w, h);
+    let weights: Option<Vec<f32>> = sel.map(|s| {
+        (0..w * h).map(|i| s.get(src.x0 + (i % w) as i32 + off.0, src.y0 + (i / w) as i32 + off.1).map_or(0.0, |v| v[0] as f32 / 255.0)).collect()
+    });
+    f.run::<C>(&mut data, w, h, weights.as_deref());
     let data = &data;
     buf.data.par_chunks_mut(stride).enumerate().skip(roi.y0 as usize).take(roi.height() as usize).for_each(|(y, row)| {
         let sy = y - src.y0 as usize;
@@ -238,7 +300,7 @@ fn apply<const C: usize>(
 /// Gaussian blur with edge pixels repeated outwards. Small radii use the
 /// exact kernel; larger ones three box blurs, which is visually identical and
 /// costs the same at any radius.
-fn gaussian_blur<const C: usize>(data: &mut Vec<f32>, w: usize, h: usize, sigma: f32) {
+pub(crate) fn gaussian_blur<const C: usize>(data: &mut Vec<f32>, w: usize, h: usize, sigma: f32) {
     if sigma < 0.05 || w == 0 || h == 0 {
         return;
     }
@@ -300,7 +362,7 @@ fn convolve_v<const C: usize>(src: &[f32], dst: &mut [f32], w: usize, h: usize, 
     });
 }
 
-fn box_h<const C: usize>(src: &[f32], dst: &mut [f32], w: usize, r: usize) {
+pub(crate) fn box_h<const C: usize>(src: &[f32], dst: &mut [f32], w: usize, r: usize) {
     let norm = 1.0 / (2 * r + 1) as f32;
     let at = |x: isize| x.clamp(0, w as isize - 1) as usize * C;
     dst.par_chunks_mut(w * C).zip(src.par_chunks(w * C)).for_each(|(d, s)| {
@@ -320,7 +382,7 @@ fn box_h<const C: usize>(src: &[f32], dst: &mut [f32], w: usize, r: usize) {
     });
 }
 
-fn box_v<const C: usize>(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
+pub(crate) fn box_v<const C: usize>(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
     let n = w * C;
     let norm = 1.0 / (2 * r + 1) as f32;
     let row = |y: isize| {

@@ -399,3 +399,171 @@ fn ai_edit_round_trip() {
     doc.state.active = small;
     assert!(aiedit::prepare(&doc.state, Source::Layer, |w, h| (w, h)).is_none());
 }
+
+/// A white canvas with a red disc and some texture, for filter tests.
+fn scene() -> Document {
+    let mut px = Pixmap::filled(160, 120, WHITE);
+    for y in 0..120 {
+        for x in 0..160 {
+            let n = ((x * 37 + y * 91) % 23) as u8;
+            let base: [u8; 3] = if (x - 60) * (x - 60) + (y - 60) * (y - 60) < 900 { [200, 40, 40] } else { [120, 130, 140] };
+            px.set(x, y, [base[0] + n, base[1] + n, base[2] + n, 255]);
+        }
+    }
+    Document::from_pixmap(px, "scene")
+}
+
+#[test]
+fn tone_and_repair_filters() {
+    use pf_core::filter::{self, Filter};
+    let spread = |doc: &Document| {
+        let d = &doc.state.layers[0].pixels.data;
+        let lum: Vec<f32> = d.chunks_exact(4).map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).collect();
+        (lum.iter().cloned().fold(f32::MAX, f32::min), lum.iter().cloned().fold(f32::MIN, f32::max))
+    };
+    let noise = |doc: &Document| {
+        // Mean difference between horizontal neighbours in a flat grey corner.
+        let p = &doc.state.layers[0].pixels;
+        (100..150).map(|x| (p.px(x, 100)[1] as f32 - p.px(x + 1, 100)[1] as f32).abs()).sum::<f32>() / 50.0
+    };
+    let run = |f: Filter| {
+        let mut doc = scene();
+        assert!(filter::apply_filter(&mut doc, &f), "{f:?}");
+        assert_eq!(doc.history().0.last(), Some(f.name()));
+        doc
+    };
+    let plain = scene();
+    let (lo, hi) = spread(&plain);
+    assert!(lo > 60.0 && hi < 200.0);
+
+    let (alo, ahi) = spread(&run(Filter::AutoContrast { clip: 0.5 }));
+    assert!(ahi > 243.0 && ahi - alo > hi - lo + 30.0, "auto contrast should stretch the range: {alo}..{ahi}");
+    let (elo, ehi) = spread(&run(Filter::Equalize { amount: 1.0 }));
+    assert!(ehi - elo > hi - lo + 40.0);
+    let (clo, chi) = spread(&run(Filter::LocalContrast { clip: 3.0, tiles: 4 }));
+    assert!(chi - clo > hi - lo, "local contrast widens the range: {clo}..{chi}");
+
+    for f in [Filter::Threshold { level: 110.0 }, Filter::AdaptiveThreshold { radius: 12.0, offset: 4.0 }] {
+        let doc = run(f);
+        assert!(doc.state.layers[0].pixels.data.chunks_exact(4).all(|p| (p[0] == 0 || p[0] == 255) && p[0] == p[1] && p[3] == 255), "{f:?} gives pure black and white");
+    }
+    let t = run(Filter::Threshold { level: 110.0 });
+    assert_eq!((px(&t, 60, 60)[0], px(&t, 140, 20)[0]), (0, 255), "dark red disc below the level, grey above");
+
+    assert!(noise(&run(Filter::UnsharpMask { radius: 1.5, amount: 1.5, threshold: 0.0 })) > noise(&plain) * 1.5);
+    for f in [Filter::SurfaceBlur { radius: 4.0, tolerance: 30.0 }, Filter::Denoise { strength: 25.0 }] {
+        let doc = run(f);
+        assert!(noise(&doc) < noise(&plain) * 0.6, "{f:?} should smooth the grain: {} vs {}", noise(&doc), noise(&plain));
+        let (a, b) = (px(&doc, 60, 60), px(&doc, 140, 60));
+        assert!(a[0] > 170 && a[1] < 90 && b[0] < 160, "{f:?} keeps the disc distinct from the background");
+    }
+
+    // Matching colours moves the average towards the reference.
+    let (mean, _) = pf_core::fx::color_stats(&Pixmap::filled(8, 8, [40, 60, 200, 255])).unwrap();
+    let m = run(Filter::MatchColors { mean, dev: [40.0, 10.0, 10.0], amount: 1.0 });
+    let p = px(&m, 140, 20);
+    assert!(p[2] > p[0] + 60, "grey should have turned blue: {p:?}");
+
+    // Lens distortion moves the picture but keeps its centre.
+    let l = run(Filter::LensDistortion { amount: 0.5 });
+    assert_ne!(l.state.layers[0].pixels.data, plain.state.layers[0].pixels.data);
+    assert!(px(&l, 80, 60)[0].abs_diff(px(&plain, 80, 60)[0]) < 30);
+
+    // Healing needs a selection, and fills it from around it.
+    let mut doc = scene();
+    doc.select("c", &selection::ellipse_mask(160, 120, 24.0, 24.0, 96.0, 96.0), Combine::Replace);
+    assert!(filter::apply_filter(&mut doc, &Filter::Inpaint { radius: 6.0 }));
+    let healed = px(&doc, 60, 60);
+    assert!(healed[0] < 160 && healed[0].abs_diff(healed[2]) < 40, "the red disc should be gone: {healed:?}");
+    assert_eq!(px(&doc, 150, 10), px(&plain, 150, 10), "outside the selection is untouched");
+}
+
+#[test]
+fn geometry() {
+    use pf_core::transform::{self, PerspectiveMode, PerspectiveOp};
+    let h = transform::homography([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)], [(0.0, 0.0), (20.0, 0.0), (20.0, 5.0), (0.0, 5.0)]).unwrap();
+    assert!((h[0] - 2.0).abs() < 1e-6 && (h[4] - 0.5).abs() < 1e-6 && h[6].abs() < 1e-9);
+    assert!(transform::homography([(0.0, 0.0); 4], [(0.0, 0.0); 4]).is_none());
+
+    // Distort: pull the top-right corner in; the layer becomes a trapezoid.
+    let mut doc = Document::new(200, 200, None);
+    let id = doc.add_image_layer("sq", Pixmap::filled(100, 100, RED));
+    let mut op = PerspectiveOp::begin(&doc).unwrap();
+    assert_eq!(op.corners(), [(50.0, 50.0), (150.0, 50.0), (150.0, 150.0), (50.0, 150.0)]);
+    let quad = [(50.0, 50.0), (150.0, 90.0), (150.0, 150.0), (50.0, 150.0)];
+    assert!(op.update(&mut doc, quad, PerspectiveMode::Distort));
+    assert_eq!(px(&doc, 60, 60), RED);
+    assert_eq!(px(&doc, 140, 60)[3], 0, "the corner that moved down leaves a gap above it");
+    assert_eq!(px(&doc, 140, 120), RED);
+    op.finish(&mut doc);
+    assert_eq!(doc.history().0.last(), Some("Perspective"));
+    // Straighten: marking that same trapezoid squares it back up.
+    let mut op = PerspectiveOp::begin(&doc).unwrap();
+    assert!(op.update(&mut doc, quad, PerspectiveMode::Straighten));
+    let l = doc.state.layer(id).unwrap();
+    assert_eq!(l.rect(), IRect::new(50, 50, 150, 150));
+    assert_eq!((px(&doc, 140, 60), px(&doc, 60, 140)), (RED, RED));
+    op.cancel(&mut doc);
+    assert_eq!(px(&doc, 140, 60)[3], 0);
+
+    // Content-aware scale: the plain background goes, the detailed stripe stays.
+    let mut img = Pixmap::filled(120, 40, WHITE);
+    for y in 0..40 {
+        for x in 50..70 {
+            img.set(x, y, if (x + y) % 2 == 0 { RED } else { [0, 0, 255, 255] });
+        }
+    }
+    let mut doc = Document::from_pixmap(img, "s");
+    assert!(doc.content_aware_scale(80, 40));
+    assert_eq!((doc.state.width, doc.state.height), (80, 40), "a single full-canvas layer takes the canvas with it");
+    let busy = doc.state.layers[0].pixels.data.chunks_exact(4).filter(|p| p[..3] != [255, 255, 255]).count();
+    assert_eq!(busy, 20 * 40, "none of the detailed stripe should have been removed");
+    assert!(doc.content_aware_scale(80, 30));
+    assert_eq!(doc.state.height, 30);
+    assert!(!doc.content_aware_scale(200, 200), "it never enlarges");
+}
+
+#[test]
+fn smart_selection() {
+    use pf_core::segment;
+    // A red disc on blue-grey: boxing it selects the disc, not the box.
+    let img = scene().state.layers[0].pixels.clone();
+    let m = segment::grabcut(&img, IRect::new(20, 20, 100, 100));
+    assert!(m.px(60, 60)[0] > 200, "disc centre is subject");
+    assert!(m.px(24, 24)[0] < 50 && m.px(96, 96)[0] < 50, "box corners are background");
+    assert_eq!(m.px(140, 60)[0], 0);
+    let area = m.data.iter().filter(|v| **v > 127).count() as f32;
+    let disc = std::f32::consts::PI * 30.0 * 30.0;
+    assert!((area - disc).abs() < disc * 0.2, "selected {area} px, the disc is {disc}");
+
+    // Regions follow edges: the disc and the background are different regions.
+    let mut flat = Pixmap::filled(160, 120, WHITE);
+    for y in 0..120 {
+        for x in 0..160 {
+            if (x - 60) * (x - 60) + (y - 60) * (y - 60) < 900 {
+                flat.set(x, y, RED);
+            }
+        }
+    }
+    let r = segment::watershed(&flat, 0.5);
+    let (inside, outside) = (r.label_at(60.0, 60.0).unwrap(), r.label_at(140.0, 20.0).unwrap());
+    assert_ne!(inside, outside);
+    assert_eq!(r.label_at(70.0, 55.0), Some(inside));
+    assert!(r.label_at(500.0, 5.0).is_none());
+    let mask = r.mask(&[inside], 160, 120);
+    assert!(mask.px(60, 60)[0] == 255 && mask.px(140, 20)[0] == 0);
+    let got = mask.data.iter().filter(|v| **v > 0).count() as f32;
+    assert!((got - disc).abs() < disc * 0.35, "region {got} px vs disc {disc}");
+
+    // Contours: a rectangle's outline is one clockwise loop of its perimeter.
+    let sel = selection::rect_mask(50, 40, IRect::new(10, 5, 30, 25));
+    let loops = segment::contours(&sel);
+    assert_eq!(loops.len(), 1);
+    let l = &loops[0];
+    assert_eq!(l.len(), 80);
+    let area2: f32 = (0..l.len()).map(|i| { let (a, b) = (l[i], l[(i + 1) % l.len()]); a.0 * b.1 - b.0 * a.1 }).sum();
+    assert_eq!(area2, 800.0, "positive area means clockwise with y pointing down");
+    let both = selection::combine(Some(&sel), &selection::rect_mask(50, 40, IRect::new(40, 30, 45, 35)), Combine::Add).unwrap();
+    let loops = segment::contours(&both);
+    assert_eq!((loops.len(), loops[0].len(), loops[1].len()), (2, 80, 20));
+}
