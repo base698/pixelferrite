@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/pf-core", "crates/pixelferrite"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.pf-core]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
