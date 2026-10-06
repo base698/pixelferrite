@@ -47,6 +47,11 @@ if [ "${1:-}" != "--no-shortcut" ]; then
     if [ ! -e "$HOME/Desktop/Pixelferrite" ]; then
         osascript -e "tell application \"Finder\" to make alias file to (POSIX file \"$PWD/$app\") at desktop" \
             -e 'tell application "Finder" to set name of result to "Pixelferrite"' >/dev/null
+        # Stamp the icon onto the alias itself; Finder does not always pick
+        # it up from an app it has not seen before.
+        osascript -l JavaScript -e 'ObjC.import("AppKit"); function run(a) {
+            return $.NSWorkspace.sharedWorkspace.setIconForFileOptions($.NSImage.alloc.initWithContentsOfFile(a[0]), a[1], 0) }' \
+            "$PWD/$app/Contents/Resources/Pixelferrite.icns" "$HOME/Desktop/Pixelferrite" >/dev/null
     fi
     echo "shortcut: $HOME/Desktop/Pixelferrite"
 fi
