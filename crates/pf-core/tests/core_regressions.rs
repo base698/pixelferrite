@@ -31,6 +31,42 @@ fn merge_rejects_backdrop_dependent_and_hidden_layers_without_changes() {
 }
 
 #[test]
+fn merge_rejects_aggregate_budget_overflow_without_mutation() {
+    // Shared raster storage keeps this valid 50-Mpixel document cheap to build.
+    let base = Layer::new("Shared", Pixmap::filled(512, 1024, RED), 0, 0);
+    let mut layers = (0..100).map(|_| {
+        let mut layer = base.clone();
+        layer.id = document::next_id();
+        layer
+    }).collect::<Vec<_>>();
+    layers[98].x = -8192;
+    layers[99].x = 7680;
+    let active = layers[99].id;
+    let mut d = Document::from_state(DocState {
+        width: 512, height: 1024, layers, selection: None, active,
+    });
+    io::limits::validate_document(&d.state).unwrap();
+    let before = d.begin();
+    let revision = d.revision();
+    let history = d.history().0.map(str::to_owned).collect::<Vec<_>>();
+    let history_pos = d.history().1;
+
+    // The merged raster fits by itself, but together with the other 98 layers
+    // would raise the document to 65 Mpixels, beyond the 64-Mpixel budget.
+    assert_eq!(d.merge_down(active), Err(MergeError::TooLarge));
+    assert_eq!(d.revision(), revision);
+    assert_eq!(d.history().1, history_pos);
+    assert_eq!(d.history().0.collect::<Vec<_>>(), history.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!((d.state.width, d.state.height, d.state.active), (before.width, before.height, before.active));
+    assert_eq!(d.state.layers.len(), before.layers.len());
+    for (after, before) in d.state.layers.iter().zip(&before.layers) {
+        assert_eq!((after.id, after.rect(), after.rev), (before.id, before.rect(), before.rev));
+        assert!(Arc::ptr_eq(&after.pixels, &before.pixels));
+        assert!(after.mask.is_none());
+    }
+}
+
+#[test]
 fn supported_merges_preserve_composites_and_undo() {
     // Every blend mode is safe when there is no additional backdrop.
     for mode in BlendMode::ALL {

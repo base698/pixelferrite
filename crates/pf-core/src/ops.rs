@@ -225,7 +225,12 @@ impl Document {
             return Err(MergeError::BackdropDependent);
         }
         let rect = lower.rect().union(upper.rect());
-        if crate::io::limits::validate_dimensions(rect.width() as u32, rect.height() as u32).is_err() {
+        let pixels = crate::io::limits::validate_dimensions(rect.width() as u32, rect.height() as u32).map_err(|_| MergeError::TooLarge)?;
+        let remaining: u64 = self.state.layers.iter().enumerate().filter(|(n, _)| *n != i && *n != i - 1).map(|(_, l)| {
+            l.pixels.w as u64 * l.pixels.h as u64 * if l.mask.is_some() { 2 } else { 1 }
+        }).sum();
+        let selection = self.state.selection.as_ref().map_or(0, |s| s.w as u64 * s.h as u64);
+        if remaining + pixels + selection > crate::io::limits::MAX_DOCUMENT_PIXELS {
             return Err(MergeError::TooLarge);
         }
         let before = self.begin();
