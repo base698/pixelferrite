@@ -26,6 +26,20 @@ pub enum Reorder {
     Back,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MergeError {
+    #[error("There is no layer below this one")]
+    NoLowerLayer,
+    #[error("Unlock both layers before merging")]
+    Locked,
+    #[error("Show both layers before merging")]
+    Hidden,
+    #[error("These blend modes depend on the layers below. Use Normal blend modes or Flatten Image to preserve the appearance")]
+    BackdropDependent,
+    #[error("The merged layer would exceed the image size limits")]
+    TooLarge,
+}
+
 impl Document {
     fn unique_name(&self, base: &str) -> String {
         let taken = |n: &str| self.state.layers.iter().any(|l| l.name == n);
@@ -36,6 +50,8 @@ impl Document {
     }
 
     /// Insert `layer` above the active layer and make it active.
+    /// Call [`Self::try_insert_layer`] for layers originating outside a
+    /// validated document operation.
     pub fn insert_layer(&mut self, name: &str, mut layer: Layer) -> LayerId {
         let before = self.begin();
         layer.name = self.unique_name(&layer.name);
@@ -46,6 +62,15 @@ impl Document {
         self.target = Target::Pixels;
         self.commit(name, before);
         id
+    }
+
+    /// Check the complete document budget before inserting a prepared layer.
+    /// Validation only clones Arc handles, not the layer's raster buffers.
+    pub fn try_insert_layer(&mut self, name: &str, layer: Layer) -> crate::io::Result<LayerId> {
+        let mut candidate = self.state.clone();
+        candidate.layers.push(layer.clone());
+        crate::io::limits::validate_document(&candidate)?;
+        Ok(self.insert_layer(name, layer))
     }
 
     pub fn add_empty_layer(&mut self) -> LayerId {
@@ -61,9 +86,46 @@ impl Document {
     }
 
     /// Add an image as a new layer, stretched to fill `rect` (document space).
-    pub fn add_image_scaled(&mut self, name: &str, px: &Pixmap, rect: IRect) -> LayerId {
-        let scaled = crate::aiedit::resize(px, rect.width().max(1) as u32, rect.height().max(1) as u32, image::imageops::FilterType::Lanczos3);
-        self.insert_layer("Add Image", Layer::new(name, scaled, rect.x0, rect.y0))
+    pub fn add_image_scaled(&mut self, name: &str, px: &Pixmap, rect: IRect) -> crate::io::Result<LayerId> {
+        let (w, h) = (rect.x1 as i64 - rect.x0 as i64, rect.y1 as i64 - rect.y0 as i64);
+        if w <= 0 || h <= 0 || w > u32::MAX as i64 || h > u32::MAX as i64 {
+            return Err(crate::io::Error::Format("invalid image placement dimensions".into()));
+        }
+        let (w, h) = (w as u32, h as u32);
+        crate::io::limits::validate_dimensions(w, h)?;
+        crate::io::limits::validate_offset(rect.x0, rect.y0)?;
+        self.check_layer_capacity(w, h)?;
+        let scaled = crate::aiedit::resize(px, w, h, image::imageops::FilterType::Lanczos3);
+        self.try_insert_layer("Add Image", Layer::new(name, scaled, rect.x0, rect.y0))
+    }
+
+    /// Check whether a new unmasked layer fits the document limits before
+    /// allocating its pixels.
+    pub fn check_layer_capacity(&self, width: u32, height: u32) -> crate::io::Result<()> {
+        let pixels = crate::io::limits::validate_dimensions(width, height)?;
+        if self.state.layers.len() >= crate::io::limits::MAX_LAYERS {
+            return Err(crate::io::Error::Format("document has reached the layer limit".into()));
+        }
+        let used: u64 = self.state.layers.iter().map(|l| {
+            l.pixels.w as u64 * l.pixels.h as u64 * if l.mask.is_some() { 2 } else { 1 }
+        }).sum();
+        if used + pixels > crate::io::limits::MAX_DOCUMENT_PIXELS {
+            return Err(crate::io::Error::Format("document exceeds the total layer pixel budget".into()));
+        }
+        Ok(())
+    }
+
+    /// Check a replacement frame for an existing layer before allocating it.
+    pub fn check_layer_resize(&self, id: LayerId, width: u32, height: u32) -> crate::io::Result<()> {
+        let pixels = crate::io::limits::validate_dimensions(width, height)?;
+        let layer = self.state.layer(id).ok_or_else(|| crate::io::Error::Format("layer no longer exists".into()))?;
+        let used: u64 = self.state.layers.iter().filter(|l| l.id != id).map(|l| {
+            l.pixels.w as u64 * l.pixels.h as u64 * if l.mask.is_some() { 2 } else { 1 }
+        }).sum();
+        if used + pixels * if layer.mask.is_some() { 2 } else { 1 } > crate::io::limits::MAX_DOCUMENT_PIXELS {
+            return Err(crate::io::Error::Format("resizing this layer would exceed the total document pixel budget".into()));
+        }
+        Ok(())
     }
 
     /// Add an image as a new layer that fills the selection: scaled (keeping
@@ -78,6 +140,10 @@ impl Document {
         let (bw, bh) = (b.width() as f32, b.height() as f32);
         let s = (bw / px.w as f32).max(bh / px.h as f32);
         let (w, h) = (((px.w as f32 * s).round() as u32).max(b.width() as u32), ((px.h as f32 * s).round() as u32).max(b.height() as u32));
+        // Cover scaling may create a very large intermediate for an extreme
+        // aspect ratio, even when the final selection is small.
+        crate::io::limits::validate_dimensions(w, h).ok()?;
+        self.check_layer_capacity(b.width() as u32, b.height() as u32).ok()?;
         let scaled = crate::aiedit::resize(px, w, h, image::imageops::FilterType::Lanczos3);
         let (ox, oy) = ((w as i32 - b.width()) / 2, (h as i32 - b.height()) / 2);
         let mut out = scaled.reframed(IRect::xywh(ox, oy, b.width() as u32, b.height() as u32), [0; 4]);
@@ -87,12 +153,12 @@ impl Document {
                 out.data[i] = ((out.data[i] as u32 * sel.px(b.x0 + x, b.y0 + y)[0] as u32 + 127) / 255) as u8;
             }
         }
-        Some(self.insert_layer("Insert Image", Layer::new(name, out, b.x0, b.y0)))
+        self.try_insert_layer("Insert Image", Layer::new(name, out, b.x0, b.y0)).ok()
     }
 
     pub fn delete_layer(&mut self, id: LayerId) {
         let Some(i) = self.state.index_of(id) else { return };
-        if self.state.layers.len() <= 1 {
+        if self.state.layers.len() <= 1 || self.state.layers[i].locked {
             return;
         }
         let before = self.begin();
@@ -127,6 +193,9 @@ impl Document {
     /// Move a layer to stack index `to` (0 = bottom).
     pub fn move_layer_to(&mut self, id: LayerId, to: usize) {
         let Some(i) = self.state.index_of(id) else { return };
+        if self.state.layers[i].locked {
+            return;
+        }
         let to = to.min(self.state.layers.len() - 1);
         if to == i {
             return;
@@ -138,10 +207,26 @@ impl Document {
     }
 
     /// Merge the layer into the one below it.
-    pub fn merge_down(&mut self, id: LayerId) {
-        let Some(i) = self.state.index_of(id) else { return };
+    pub fn merge_down(&mut self, id: LayerId) -> Result<(), MergeError> {
+        let Some(i) = self.state.index_of(id) else { return Err(MergeError::NoLowerLayer) };
         if i == 0 {
-            return;
+            return Err(MergeError::NoLowerLayer);
+        }
+        let (lower, upper) = (&self.state.layers[i - 1], &self.state.layers[i]);
+        if lower.locked || upper.locked {
+            return Err(MergeError::Locked);
+        }
+        if !lower.visible || !upper.visible {
+            return Err(MergeError::Hidden);
+        }
+        // Normal source-over layers can be collapsed associatively. Other
+        // modes need the real backdrop, unless this is the bottom pair.
+        if i > 1 && (lower.blend != BlendMode::Normal || upper.blend != BlendMode::Normal) {
+            return Err(MergeError::BackdropDependent);
+        }
+        let rect = lower.rect().union(upper.rect());
+        if crate::io::limits::validate_dimensions(rect.width() as u32, rect.height() as u32).is_err() {
+            return Err(MergeError::TooLarge);
         }
         let before = self.begin();
         let upper = self.state.layers.remove(i);
@@ -159,16 +244,22 @@ impl Document {
         lower.mask = None;
         lower.text = None;
         lower.opacity = 1.0;
+        lower.blend = BlendMode::Normal;
+        lower.visible = true;
         lower.x = rect.x0;
         lower.y = rect.y0;
         lower.touch();
         self.state.active = lower.id;
         self.target = Target::Pixels;
         self.commit("Merge Down", before);
+        Ok(())
     }
 
     /// Flatten everything into one canvas-sized layer.
     pub fn flatten_image(&mut self) {
+        if self.state.layers.iter().any(|l| l.locked) {
+            return;
+        }
         let before = self.begin();
         let layer = Layer::new("Background", composite::flatten(&self.state), 0, 0);
         self.state.active = layer.id;
@@ -180,6 +271,9 @@ impl Document {
     pub fn flip_layer(&mut self, id: LayerId, horizontal: bool) {
         let before = self.begin();
         let Some(l) = self.state.layer_mut(id) else { return };
+        if l.locked {
+            return;
+        }
         l.text = None;
         let px = Arc::make_mut(&mut l.pixels);
         if horizontal { px.flip_h() } else { px.flip_v() }
@@ -207,7 +301,7 @@ impl Document {
         let before = self.begin();
         let sel = self.state.selection.clone();
         let Some(l) = self.state.layer_mut(id) else { return };
-        if l.mask.is_some() {
+        if l.locked || l.mask.is_some() {
             return;
         }
         let mut m = Mask::filled(l.pixels.w, l.pixels.h, [255]);
@@ -229,6 +323,9 @@ impl Document {
     pub fn delete_mask(&mut self, id: LayerId) {
         let before = self.begin();
         let Some(l) = self.state.layer_mut(id) else { return };
+        if l.locked {
+            return;
+        }
         if l.mask.take().is_none() {
             return;
         }
@@ -241,6 +338,9 @@ impl Document {
     pub fn apply_mask(&mut self, id: LayerId) {
         let before = self.begin();
         let Some(l) = self.state.layer_mut(id) else { return };
+        if l.locked {
+            return;
+        }
         let Some(m) = l.mask.take() else { return };
         l.text = None;
         let px = Arc::make_mut(&mut l.pixels);
@@ -255,6 +355,9 @@ impl Document {
     pub fn invert_mask(&mut self, id: LayerId) {
         let before = self.begin();
         let Some(l) = self.state.layer_mut(id) else { return };
+        if l.locked {
+            return;
+        }
         let Some(m) = &mut l.mask else { return };
         Arc::make_mut(m).data.iter_mut().for_each(|v| *v = 255 - *v);
         l.touch();
@@ -304,10 +407,16 @@ impl Document {
             return None;
         }
         let local = area.translate(-l.x, -l.y);
-        let mut px = Pixmap::from_raw(area.width() as u32, area.height() as u32, l.pixels.crop_bytes(local));
+        let copying_mask = self.effective_target() == Target::Mask;
+        let mut px = if copying_mask {
+            let bytes = l.mask.as_ref()?.crop_bytes(local).into_iter().flat_map(|v| [v, v, v, 255]).collect();
+            Pixmap::from_raw(area.width() as u32, area.height() as u32, bytes)
+        } else {
+            Pixmap::from_raw(area.width() as u32, area.height() as u32, l.pixels.crop_bytes(local))
+        };
         for y in 0..px.h as i32 {
             for x in 0..px.w as i32 {
-                let mut k = l.mask_at(local.x0 + x, local.y0 + y) as u32;
+                let mut k = if copying_mask { 255 } else { l.mask_at(local.x0 + x, local.y0 + y) as u32 };
                 if let Some(s) = &self.state.selection {
                     k = k * s.px(area.x0 + x, area.y0 + y)[0] as u32 / 255;
                 }
@@ -330,9 +439,11 @@ impl Document {
     }
 
     pub fn cut(&mut self) -> Option<Clip> {
+        if self.state.active_layer()?.locked {
+            return None;
+        }
         let clip = self.copy()?;
-        self.clear();
-        Some(clip)
+        self.clear().then_some(clip)
     }
 
     pub fn paste(&mut self, clip: &Clip) -> LayerId {

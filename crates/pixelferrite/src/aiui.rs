@@ -8,14 +8,22 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use egui::{Color32, ColorImage, Context, Key, RichText, TextureHandle, TextureOptions, vec2};
 use pf_core::aiedit::{self, AiJob, Source};
-use pf_core::{IRect, Pixmap, io};
+use pf_core::{IRect, Layer, Pixmap, io};
 
 use crate::ai;
 use crate::app::App;
-use crate::canvas;
 use crate::store::{AiRecord, Settings as Saved, timestamp};
 
 const WARN: Color32 = Color32::from_rgb(255, 170, 90);
+
+fn document_session() -> u64 {
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let seed = SEED.get_or_init(|| {
+        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        time ^ u64::from(std::process::id()).rotate_left(32)
+    });
+    seed.wrapping_add(pf_core::document::next_id()).max(1)
+}
 
 struct Prompt {
     text: String,
@@ -28,11 +36,17 @@ struct Prompt {
 
 /// A request that is out with the model.
 pub struct Run {
-    rx: Receiver<Result<Pixmap, String>>,
+    rx: Receiver<Result<Completed, String>>,
     job: AiJob,
     prompt: String,
     started: f64,
     cancelled: Arc<AtomicBool>,
+    pending: Option<Completed>,
+}
+
+struct Completed {
+    pixels: Pixmap,
+    history_error: Option<String>,
 }
 
 struct History {
@@ -56,11 +70,12 @@ pub struct AiUi {
     source: Source,
     history: Option<History>,
     settings: Option<SettingsDlg>,
+    document_session: u64,
 }
 
 impl Default for AiUi {
     fn default() -> Self {
-        Self { prompt: None, run: None, error: None, last_prompt: String::new(), source: Source::Visible, history: None, settings: None }
+        Self { prompt: None, run: None, error: None, last_prompt: String::new(), source: Source::Visible, history: None, settings: None, document_session: document_session() }
     }
 }
 
@@ -93,6 +108,7 @@ impl AiUi {
     pub fn document_changed(&mut self) {
         self.prompt = None;
         self.run = None;
+        self.document_session = document_session();
     }
 }
 
@@ -140,6 +156,7 @@ impl App {
     }
 
     fn open_ai_prompt_with(&mut self, text: Option<String>) {
+        if self.mutation_busy() { return self.toast("Finish the current operation before opening the AI prompt"); }
         if self.ai.run.is_some() {
             return self.toast("The AI is still working on the last request");
         }
@@ -153,12 +170,20 @@ impl App {
     }
 
     /// Send the active layer (or the selected part of it) to the model. The
-    /// request is recorded on disk before it leaves.
+    /// request is recorded before upload only when history is enabled.
     pub fn send_to_ai(&mut self, ctx: &Context, prompt: String, cfg: ai::Config, source: Source) {
+        if self.mutation_busy() || self.ai.run.is_some() {
+            return self.toast("Finish the current operation before sending another image");
+        }
+        if let Err(e) = ai::endpoint_origin(&cfg.base) { return self.toast(e); }
         let model = cfg.model.clone();
         let Some(job) = aiedit::prepare(&self.doc.state, source, |w, h| ai::request_size(&model, w, h)) else {
             return self.toast("Nothing to send: the selection doesn't touch this layer");
         };
+        let result_rect = job.result_rect();
+        if let Err(e) = self.doc.check_layer_capacity(result_rect.width() as u32, result_rect.height() as u32) {
+            return self.toast(format!("Free layer capacity before sending this request: {e}"));
+        }
         let r = job.rect;
         let mut record = AiRecord {
             id: self.store.new_ai_id(),
@@ -173,43 +198,60 @@ impl App {
             region: [r.x0, r.y0, r.x1, r.y1],
             source: if source == Source::Visible { "visible" } else { "layer" }.to_owned(),
             selection: job.mask.is_some(),
+            canvas_size: [self.doc.state.width, self.doc.state.height],
+            document_session: self.ai.document_session,
+            source_layer: Some(job.layer),
             ..Default::default()
         };
-        if let Err(e) = self.store.write_ai_record(&record) {
-            self.toast(format!("Couldn't record the request: {e}"));
-        }
-
+        let keep = self.saved.ai.keep_history;
+        let token = match self.store.begin_ai_record(&record, keep) {
+            Ok(token) => token,
+            Err(e) => { self.toast(format!("History could not be saved: {e}")); None }
+        };
         let (tx, rx) = channel();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (image, mask) = (job.image.clone(), job.mask.clone());
-        let (store, text, flag, ctx2, keep) = (self.store.clone(), record.sent_prompt.clone(), cancelled.clone(), ctx.clone(), self.saved.ai.keep_history);
+        let worker_job = job.clone();
+        let (store, text, flag, ctx2) = (self.store.clone(), record.sent_prompt.clone(), cancelled.clone(), ctx.clone());
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
+            let mut history_error = None;
             let result = (|| {
-                let png = io::encode_png(&image).map_err(|e| e.to_string())?;
-                let mask_png = mask.as_ref().map(io::encode_png).transpose().map_err(|e| e.to_string())?;
-                let _ = store.write_ai_file(&record.id, "input.png", &png);
-                if let Some(m) = &mask_png {
-                    let _ = store.write_ai_file(&record.id, "mask.png", m);
-                }
-                ai::edit(&cfg, &text, (image.w, image.h), &png, mask_png.as_deref())
+                let png = io::encode_png(&worker_job.image).map_err(|e| e.to_string())?;
+                let mask_png = worker_job.mask.as_ref().map(io::encode_png).transpose().map_err(|e| e.to_string())?;
+                if let Err(e) = store.record_ai(token.as_ref(), |s| {
+                    s.write_ai_file(&record.id, "input.png", &png)?;
+                    if let Some(m) = &mask_png { s.write_ai_file(&record.id, "mask.png", m)?; }
+                    Ok(())
+                }) { history_error = Some(e.to_string()); }
+                ai::edit(&cfg, &text, (worker_job.image.w, worker_job.image.h), &png, mask_png.as_deref())
             })();
             record.duration_ms = started.elapsed().as_millis() as u64;
-            record.status = if flag.load(Ordering::Relaxed) { "cancelled" } else if result.is_ok() { "done" } else { "error" }.to_owned();
-            match &result {
-                Ok(reply) => {
-                    let _ = store.write_ai_file(&record.id, "output.png", &reply.file);
-                    record.usage = reply.usage.clone();
-                }
-                Err(e) => record.error = e.clone(),
+            record.status = if flag.load(Ordering::Relaxed) { "discarded" } else if result.is_ok() { "done" } else { "error" }.to_owned();
+            if let Some(token) = token.as_ref() {
+                let persist = (|| -> Result<(), String> {
+                    let rendered = match &result {
+                        Ok(reply) => {
+                            let layer = worker_job.result_layer(&reply.pixels, "AI result");
+                            record.result_origin = Some([layer.x, layer.y]);
+                            record.usage = reply.usage.clone();
+                            Some(io::encode_png(&layer.pixels).map_err(|e| e.to_string())?)
+                        }
+                        Err(e) => { record.error = e.clone(); None }
+                    };
+                    store.record_ai(Some(token), |s| {
+                        if let Ok(reply) = &result { s.write_ai_file(&record.id, "output.png", &reply.file)?; }
+                        if let Some(png) = &rendered { s.write_ai_file(&record.id, "result.png", png)?; }
+                        s.write_ai_record(&record)
+                    }).map_err(|e| e.to_string())
+                })();
+                if let Err(e) = persist { history_error = Some(e); }
+                if let Err(e) = store.prune_ai_current() { history_error = Some(e.to_string()); }
             }
-            let _ = store.write_ai_record(&record);
-            store.prune_ai(keep);
-            let _ = tx.send(result.map(|r| r.pixels));
+            let _ = tx.send(result.map(|r| Completed { pixels: r.pixels, history_error }));
             ctx2.request_repaint();
         });
         self.ai.last_prompt = prompt.clone();
-        self.ai.run = Some(Run { rx, job, prompt, started: self.now, cancelled });
+        self.ai.run = Some(Run { rx, job, prompt, started: self.now, cancelled, pending: None });
         self.refresh_ai_history();
     }
 
@@ -234,7 +276,12 @@ impl App {
     }
 
     pub fn open_settings(&mut self) {
-        self.ai.settings = Some(SettingsDlg { edit: self.store.load_settings().0, show_key: false });
+        let mut edit = self.store.load_settings().0;
+        if !edit.ai.api_key.is_empty() && ai::Config::load(&edit.ai).key.is_none() {
+            edit.ai.api_key.clear();
+            edit.ai.api_key_origin.clear();
+        }
+        self.ai.settings = Some(SettingsDlg { edit, show_key: false });
     }
 
     pub fn ai_dialogs(&mut self, ctx: &Context) {
@@ -305,16 +352,20 @@ impl App {
             ui.add_space(4.0);
             match &p.cfg.key {
                 Some(_) => {
-                    let note = format!("Uploaded to OpenAI ({}), using the key from {}. Usually takes up to a minute.", p.cfg.model, p.cfg.key_source);
+                    let destination = ai::endpoint_origin(&p.cfg.base).unwrap_or_else(|e| e);
+                    let note = format!("Uploads to {destination} ({}), using the key from {}. Usually takes up to a minute.", p.cfg.model, p.cfg.key_source);
                     ui.label(RichText::new(note).small().weak());
                 }
                 None => {
                     ui.colored_label(WARN, "No OpenAI key found.");
-                    ui.label(RichText::new("Add one in File > Settings, then open this dialog again.").small());
+                    ui.label(RichText::new(if p.cfg.key_source.starts_with("The endpoint changed") { p.cfg.key_source.as_str() } else { "Add one in File > Settings, then open this dialog again." }).small());
                 }
             }
             ui.add_space(10.0);
-            let ready = p.cfg.key.is_some() && (selection || !p.text.trim().is_empty());
+            let endpoint = ai::endpoint_origin(&p.cfg.base);
+            if let Err(e) = &endpoint { ui.colored_label(WARN, e); }
+            if self.saved.ai.keep_history == 0 { ui.label(RichText::new("History is off: this request and its images will not be saved locally.").small()); }
+            let ready = p.cfg.key.is_some() && endpoint.is_ok() && (selection || !p.text.trim().is_empty());
             buttons_right(ui, 440.0, |ui| {
                 let cmd_enter = ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
                 send = (ui.add_enabled(ready, egui::Button::new("Send")).on_hover_text("\u{2318}/Ctrl + Enter").clicked() || cmd_enter) && ready;
@@ -345,8 +396,27 @@ impl App {
 
     /// Collect the answer if it has arrived; otherwise show progress.
     fn ai_poll(&mut self, ctx: &Context) {
-        let Some(run) = &self.ai.run else { return };
-        let outcome = match run.rx.try_recv() {
+        if self.mutation_busy() {
+            if self.ai.run.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(250)); }
+            return;
+        }
+        let Some(run) = &mut self.ai.run else { return };
+        if run.pending.is_some() {
+            let (mut retry, mut discard) = (false, false);
+            egui::Area::new(egui::Id::new("ai-ready")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -64.0]).order(egui::Order::Foreground).show(ctx, |ui| {
+                egui::Frame::new().fill(Color32::from_black_alpha(225)).corner_radius(8).inner_margin(12).show(ui, |ui| {
+                    ui.label("AI result is ready. Free some layer capacity, then add it.");
+                    ui.horizontal(|ui| {
+                        retry = ui.button("Add Result").clicked();
+                        discard = ui.button("Discard Result").clicked();
+                    });
+                });
+            });
+            if discard { self.ai.run = None; return; }
+            if !retry { return; }
+        }
+        let received = run.pending.take().map(|done| Ok(Ok(done))).unwrap_or_else(|| run.rx.try_recv());
+        let outcome = match received {
             Ok(r) => r,
             Err(TryRecvError::Disconnected) => Err("The request stopped unexpectedly.".to_owned()),
             Err(TryRecvError::Empty) => {
@@ -357,26 +427,36 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label(RichText::new(format!("AI is working\u{2026} {secs} s")).color(Color32::WHITE));
-                            cancel = ui.small_button("Cancel").clicked();
+                            cancel = ui.small_button("Discard when ready").on_hover_text("Stops adding the result to this document. The request may still finish and be billed.").clicked();
                         });
                     });
                 });
                 if cancel {
                     run.cancelled.store(true, Ordering::Relaxed);
                     self.ai.run = None;
-                    self.toast("AI request cancelled");
+                    self.toast("Result will not be added. The API request may still finish and be billed.");
                 }
                 ctx.request_repaint_after(std::time::Duration::from_millis(250));
                 return;
             }
         };
+        if outcome.is_ok() {
+            let r = run.job.result_rect();
+            if let Err(e) = self.doc.check_layer_capacity(r.width() as u32, r.height() as u32) {
+                run.pending = outcome.ok();
+                self.toast(format!("AI result kept in memory until a layer can be added: {e}"));
+                return;
+            }
+        }
         let run = self.ai.run.take().unwrap();
         match outcome {
-            Ok(px) => {
+            Ok(done) => {
                 let short: String = if run.prompt.is_empty() { "extend".to_owned() } else { run.prompt.chars().take(28).collect() };
-                canvas::cancel(self);
-                self.doc.insert_ai_result(&run.job, &px, &format!("AI: {short}"));
-                self.toast("AI result added as a new layer");
+                self.doc.insert_ai_result(&run.job, &done.pixels, &format!("AI: {short}"));
+                self.toast(match done.history_error {
+                    Some(e) => format!("AI result added, but its history could not be saved: {e}"),
+                    None => "AI result added as a new layer".into(),
+                });
             }
             Err(e) => self.ai.error = Some(e),
         }
@@ -384,10 +464,12 @@ impl App {
     }
 
     fn ai_history_window(&mut self, ctx: &Context) {
+        let can_insert = !self.mutation_busy();
         let Some(h) = &mut self.ai.history else { return };
         let store = self.store.clone();
-        let (mut open, mut delete, mut reuse, mut add) = (true, None, None, None);
+        let (mut open, mut delete, mut reuse, mut add, mut clear) = (true, None, None, None, false);
         egui::Window::new("AI Requests").open(&mut open).default_pos(self.view.vp.left_top() + vec2(24.0, 24.0)).default_size([780.0, 520.0]).min_width(560.0).show(ctx, |ui| {
+            if ui.button("Clear All History").on_hover_text("Deletes saved prompts and images, including recordings from requests still running.").clicked() { clear = true; }
             if h.records.is_empty() {
                 ui.label(RichText::new("No requests yet. Use Layer > Send to AI with Prompt\u{2026}").weak());
                 return;
@@ -398,7 +480,7 @@ impl App {
                         let mark = match r.status.as_str() {
                             "done" => egui_phosphor::regular::CHECK,
                             "error" => egui_phosphor::regular::WARNING,
-                            "cancelled" => egui_phosphor::regular::X,
+                            "cancelled" | "discarded" => egui_phosphor::regular::X,
                             _ => egui_phosphor::regular::DOTS_THREE,
                         };
                         let when = r.created.replace('T', " ").trim_end_matches('Z').to_owned();
@@ -419,7 +501,7 @@ impl App {
                 let status = match r.status.as_str() {
                     "done" => "Done".to_owned(),
                     "error" => "Failed".to_owned(),
-                    "cancelled" => "Cancelled".to_owned(),
+                    "cancelled" | "discarded" => "Not added (the API request may still be billed)".to_owned(),
                     _ => "Sent, no answer recorded".to_owned(),
                 };
                 let secs = r.duration_ms as f32 / 1000.0;
@@ -442,7 +524,7 @@ impl App {
                 let w = ((ui.available_width() - 12.0) / 2.0).max(120.0);
                 ui.horizontal_top(|ui| {
                     for (file, label) in [("input.png", "Sent"), ("output.png", "Came back")] {
-                        let tex = h.images.entry(file).or_insert_with(|| io::load_pixmap(&dir.join(file)).ok().map(|px| texture(ui.ctx(), &format!("ai-{file}"), &px)));
+                        let tex = h.images.entry(file).or_insert_with(|| store.ai_file(&r.id, file).and_then(|path| io::load_pixmap(&path).ok()).map(|px| texture(ui.ctx(), &format!("ai-{file}"), &px)));
                         ui.vertical(|ui| {
                             ui.set_width(w);
                             ui.label(RichText::new(label).small());
@@ -460,7 +542,8 @@ impl App {
                 });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(dir.join("output.png").exists(), egui::Button::new("Add Result as Layer")).clicked() {
+                    let available = store.ai_file(&r.id, "result.png").is_some() || (!r.selection && store.ai_file(&r.id, "output.png").is_some());
+                    if ui.add_enabled(can_insert && available, egui::Button::new("Add Result as Layer")).on_hover_text(if r.selection && !available { "This older request has no saved clipped layer. Its raw response is available through Show Files." } else { "Restore the saved layer with its original selection clipping." }).clicked() {
                         add = Some(r.clone());
                     }
                     if ui.button("Reuse Prompt").clicked() {
@@ -478,29 +561,61 @@ impl App {
         if !open {
             self.ai.history = None;
         }
+        if clear {
+            if let Err(e) = self.store.clear_ai() { self.toast(format!("Could not clear AI history: {e}")); }
+            self.refresh_ai_history();
+        }
         if let Some(id) = delete {
-            self.store.delete_ai(&id);
+            if let Err(e) = self.store.delete_ai(&id) { self.toast(format!("Could not delete AI history: {e}")); }
             self.refresh_ai_history();
         }
         if let Some(text) = reuse {
             self.open_ai_prompt_with(Some(text));
         }
         if let Some(r) = add {
-            match io::load_pixmap(&self.store.ai_path(&r.id).join("output.png")) {
-                Ok(px) => {
-                    // Back where it came from if that still fits this image, else centred.
-                    let region = IRect::new(r.region[0], r.region[1], r.region[2], r.region[3]);
-                    let short: String = r.prompt.chars().take(28).collect();
-                    let name = format!("AI: {short}");
-                    if !region.intersect(self.doc.canvas()).is_empty() && r.document == self.source_file().map(|p| p.display().to_string()).unwrap_or_default() {
-                        self.doc.add_image_scaled(&name, &px, region);
-                    } else {
-                        self.doc.add_image_layer(&name, px);
-                    }
-                }
-                Err(e) => self.toast(format!("Couldn't load the result: {e}")),
-            }
+            if let Err(e) = self.restore_ai_record(&r) { self.toast(e); }
         }
+    }
+
+    fn restore_ai_record(&mut self, r: &AiRecord) -> Result<(), String> {
+        if self.mutation_busy() { return Err("Finish the current operation before adding this result.".into()); }
+        let exact = r.result_origin.is_some() && self.store.ai_file(&r.id, "result.png").is_some();
+        if r.selection && !exact {
+            return Err("This older request has no saved clipped layer. Its raw response is available through Show Files.".into());
+        }
+        let file = self.store.ai_file(&r.id, if exact { "result.png" } else { "output.png" }).ok_or("The saved image is missing or is not a regular file.")?;
+        let px = io::load_pixmap(&file).map_err(|e| format!("Couldn't load the result: {e}"))?;
+        let same_session = r.document_session != 0 && r.document_session == self.ai.document_session;
+        let same_file = !r.document.is_empty() && r.document == self.source_file().map(|p| p.display().to_string()).unwrap_or_default();
+        let same_size = r.canvas_size == [self.doc.state.width, self.doc.state.height] || r.canvas_size == [0; 2];
+        let positioned = same_size && (same_session || same_file);
+        let short: String = r.prompt.chars().take(28).collect();
+        let name = format!("AI: {short}");
+        if positioned {
+            if r.source == "visible" {
+                if let Some(l) = self.doc.state.layers.last() { self.doc.state.active = l.id; }
+            } else if let Some(id) = r.source_layer.filter(|id| same_session && self.doc.state.layer(*id).is_some()) {
+                self.doc.state.active = id;
+            }
+            if let Some([x, y]) = r.result_origin.filter(|_| exact) {
+                io::limits::validate_offset(x, y).map_err(|e| e.to_string())?;
+                self.doc.try_insert_layer("AI History", Layer::new(&name, px, x, y)).map_err(|e| e.to_string())?;
+            } else {
+                let [x0, y0, x1, y1] = r.region;
+                let width = u32::try_from(i64::from(x1) - i64::from(x0)).map_err(|_| "Invalid saved image width")?;
+                let height = u32::try_from(i64::from(y1) - i64::from(y0)).map_err(|_| "Invalid saved image height")?;
+                io::limits::validate_dimensions(width, height).map_err(|e| e.to_string())?;
+                io::limits::validate_offset(x0, y0).map_err(|e| e.to_string())?;
+                let region = IRect::new(x0, y0, x1, y1);
+                if region.is_empty() { return Err("The saved request has an invalid image area.".into()); }
+                self.doc.add_image_scaled(&name, &px, region).map_err(|e| e.to_string())?;
+            }
+        } else {
+            let x = (self.doc.state.width as i32 - px.w as i32) / 2;
+            let y = (self.doc.state.height as i32 - px.h as i32) / 2;
+            self.doc.try_insert_layer("AI History", Layer::new(&name, px, x, y)).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     fn settings_dialog(&mut self, ctx: &Context) {
@@ -513,6 +628,11 @@ impl App {
             ui.add_space(6.0);
             ui.label(RichText::new("AI (OpenAI)").strong());
             egui::Grid::new("settings-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("API URL");
+                let before_url = d.edit.ai.base_url.clone();
+                ui.add(egui::TextEdit::singleline(&mut d.edit.ai.base_url).desired_width(270.0).hint_text("https://api.openai.com/v1"));
+                if d.edit.ai.base_url != before_url { d.edit.ai.api_key.clear(); d.edit.ai.api_key_origin.clear(); }
+                ui.end_row();
                 ui.label("API key");
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut d.edit.ai.api_key).password(!d.show_key).desired_width(270.0).hint_text("sk-\u{2026}"));
@@ -530,13 +650,14 @@ impl App {
                 });
                 ui.end_row();
                 ui.label("Keep");
-                ui.add(egui::DragValue::new(&mut d.edit.ai.keep_history).range(1..=5000).suffix(" past requests"));
+                ui.add(egui::DragValue::new(&mut d.edit.ai.keep_history).range(0..=5000).suffix(" past requests"));
                 ui.end_row();
             });
             ui.add_space(6.0);
+            ui.label(RichText::new("Set Keep to 0 to disable history and erase saved requests. Changing the API URL clears the old key; enter the key for the new destination.").small().weak());
             let live = ai::Config::load(&d.edit.ai);
             let note = match &live.key {
-                Some(_) if live.key_source != "Pixelferrite settings" => format!("Right now the key from {} is used; it takes precedence over the one here.", live.key_source),
+                Some(_) if live.key_source != "Pixelferrite settings" => format!("The key from {} will be used while the settings key is empty.", live.key_source),
                 Some(_) => "Higher quality costs more per request.".to_owned(),
                 None => "No key yet: AI edits won't work until one is set.".to_owned(),
             };
@@ -549,13 +670,27 @@ impl App {
             });
         });
         if save {
+            let d = self.ai.settings.as_mut().unwrap();
+            let base = if d.edit.ai.base_url.trim().is_empty() { "https://api.openai.com/v1" } else { d.edit.ai.base_url.trim() };
+            match ai::endpoint_origin(base) {
+                Ok(origin) => d.edit.ai.api_key_origin = origin,
+                Err(e) => { self.toast(e); return; }
+            }
             let d = self.ai.settings.take().unwrap();
             match self.store.save_settings(&d.edit) {
-                Ok(()) => self.saved = d.edit,
-                Err(e) => self.toast(format!("Couldn't save settings: {e}")),
+                Ok(()) => {
+                    if let Err(e) = self.store.prune_ai(d.edit.ai.keep_history) { self.toast(format!("Could not apply history retention: {e}")); }
+                    self.saved = d.edit;
+                    self.refresh_ai_history();
+                },
+                Err(e) => { self.ai.settings = Some(d); self.toast(format!("Couldn't save settings: {e}")); },
             }
         } else if close {
             self.ai.settings = None;
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ai_regressions.rs"]
+mod regressions;

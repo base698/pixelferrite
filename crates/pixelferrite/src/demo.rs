@@ -154,7 +154,7 @@ fn readme_ai_extend() {
     // A portrait painting in the middle of a wide canvas, empty either side.
     let px = io::load_pixmap(&art("Wanderer above the Sea of Fog.jpg")).unwrap();
     let mut doc = Document::new(1536, 1024, None);
-    doc.add_image_scaled("Wanderer above the Sea of Fog", &px, IRect::new(368, 0, 1168, 1024));
+    doc.add_image_scaled("Wanderer above the Sea of Fog", &px, IRect::new(368, 0, 1168, 1024)).unwrap();
     let file = out("wanderer-wide.ora");
     io::save(&mut doc, &file).unwrap();
     let mut h = launch(Some(file));

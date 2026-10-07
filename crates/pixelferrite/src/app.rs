@@ -13,6 +13,7 @@ use crate::fonts::Fonts;
 use crate::fxui::{ScaleDlg, Warp};
 use crate::store::{Settings as Saved, Store};
 use crate::panels;
+use crate::recovery::{Recovery, Candidate};
 use crate::tools::{Settings, Tool};
 use crate::view::{Display, View};
 
@@ -29,6 +30,7 @@ pub enum Action {
     Save,
     SaveAs,
     Export,
+    ExportCompatible,
     Undo,
     Redo,
     Cut,
@@ -79,10 +81,11 @@ fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInc
 
 /// A filter being previewed in its dialog.
 pub struct FilterDlg {
-    op: FilterOp,
-    filter: Filter,
+    pub(crate) op: FilterOp,
+    pub(crate) filter: Filter,
+    pub(crate) before: DocState,
     /// Parameters changed since the preview was last rendered.
-    pending: bool,
+    pub(crate) pending: bool,
 }
 
 pub struct Thumb {
@@ -141,6 +144,12 @@ pub struct App {
     pub saved: Saved,
     title: String,
     pub now: f64,
+    pending_drops: Vec<PathBuf>,
+    pub error: Option<String>,
+    recovery: Option<Recovery>,
+    recoveries: Vec<Candidate>,
+    recovered_source: Option<Candidate>,
+    pub(crate) work: Option<crate::jobs::Work>,
 }
 
 impl App {
@@ -156,6 +165,11 @@ impl App {
         #[cfg(not(test))]
         let store = Store::standard();
         let (saved, settings_error) = store.load_settings();
+        let retention_error = store.prune_ai(saved.ai.keep_history).err().map(|e| format!("Couldn't apply AI history retention: {e}"));
+        let recovery_root = store.data_dir.join("recovery");
+        let recoveries = Recovery::discover(&recovery_root);
+        let recovery = Recovery::new(&recovery_root);
+        let recovery_error = recovery.as_ref().err().map(|e| format!("Crash recovery is unavailable: {e}"));
         let mut app = Self {
             doc: Document::new(1600, 1200, Some([255; 4])),
             view: View::new(),
@@ -195,6 +209,12 @@ impl App {
             saved,
             title: String::new(),
             now: 0.0,
+            pending_drops: Vec::new(),
+            error: recovery_error.or(retention_error),
+            recovery: recovery.ok(),
+            recoveries,
+            recovered_source: None,
+            work: None,
         };
         if let Some(e) = settings_error {
             app.toast(format!("Couldn't read settings, using defaults. {e}"));
@@ -223,6 +243,9 @@ impl App {
 
     fn set_doc(&mut self, doc: Document) {
         canvas::cancel(self);
+        self.cancel_work();
+        if let Some(recovery) = &mut self.recovery { recovery.clear(); }
+        if let Some(old) = self.recovered_source.take() { old.discard(); }
         self.opened = None;
         self.doc = doc;
         self.doc.mark_all_dirty();
@@ -256,13 +279,23 @@ impl App {
         let spec = TextSpec { text: "Text".to_owned(), path, path_offset: 0.0, ..self.settings.text.clone() };
         let (data, index) = self.fonts.face(&spec.font, spec.bold, spec.italic);
         let Ok(font) = FontRef::try_from_slice_and_index(&data, index) else { return };
-        self.doc.add_text_layer(spec, (origin.x.round() as i32, origin.y.round() as i32), &font);
-        self.text_focus = Some(true);
+        match self.doc.try_add_text_layer(spec, (origin.x.round() as i32, origin.y.round() as i32), &font) {
+            Ok(_) => self.text_focus = Some(true),
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    /// Every outside mutation (file drops, AI completion, history insertion) uses
+    /// this gate so a preview snapshot can never roll back an unrelated edit.
+    pub fn mutation_busy(&self) -> bool {
+        self.busy() || !matches!(self.drag, Drag::None) || self.prop.is_some()
+            || self.layer_drag.is_some() || self.new_doc.is_some() || self.scale_dlg.is_some()
+            || self.ai.modal_open() || self.error.is_some() || !self.recoveries.is_empty()
     }
 
     /// A filter dialog or on-canvas operation owns the image for now.
     pub fn busy(&self) -> bool {
-        self.filter.is_some() || self.warp.is_some()
+        self.filter.is_some() || self.warp.is_some() || self.background_active()
     }
 
     fn open_filter(&mut self, mut filter: Filter) {
@@ -277,15 +310,16 @@ impl App {
             }
         }
         match FilterOp::begin(&self.doc) {
-            Some(mut op) => {
-                op.update(&mut self.doc, &filter);
-                self.filter = Some(FilterDlg { op, filter, pending: false });
+            Some(op) => {
+                self.filter = Some(FilterDlg { op, filter, before: self.doc.begin(), pending: true });
+                self.schedule_filter();
             }
             None => self.toast("This layer is hidden or locked"),
         }
     }
 
     fn filter_dialog(&mut self, ctx: &Context) {
+        let computing = self.background_active();
         let Some(d) = &mut self.filter else { return };
         let (mut apply, mut cancel, mut changed, mut select) = (false, false, false, false);
         egui::Window::new(d.filter.name())
@@ -295,6 +329,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_width(250.0);
                 ui.spacing_mut().slider_width = 170.0;
+                ui.add_enabled_ui(!computing, |ui| {
                 match &mut d.filter {
                     Filter::GaussianBlur { radius } => {
                         ui.label("Radius");
@@ -387,25 +422,38 @@ impl App {
                         changed |= slider(ui, "Amount", amount, -0.6..=0.6, false, "", "Right straightens lines that bulge outwards, left ones that bow inwards");
                     }
                 }
+                });
                 let scope = if self.doc.state.selection.is_some() { "the selection on" } else { "all of" };
                 let what = if self.doc.effective_target() == pf_core::Target::Mask { "mask" } else { "layer" };
                 ui.label(egui::RichText::new(format!("Applies to {scope} the active {what}.")).small().weak());
                 ui.add_space(8.0);
                 ui.allocate_ui_with_layout(vec2(250.0, 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    apply = ui.button("Apply").clicked();
+                    apply = ui.add_enabled(!computing && !changed && !d.pending, egui::Button::new("Apply")).clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
         if !ctx.egui_wants_keyboard_input() {
-            apply |= ctx.input(|i| i.key_pressed(Key::Enter));
+            apply |= !computing && !changed && !d.pending && ctx.input(|i| i.key_pressed(Key::Enter));
             cancel |= ctx.input(|i| i.key_pressed(Key::Escape));
         }
         if select {
             let d = self.filter.take().unwrap();
-            if let Filter::EdgeDetect(p) = &d.filter {
-                d.op.select_edges(&mut self.doc, p);
+            if let Filter::EdgeDetect(p) = d.filter {
+                d.op.cancel(&mut self.doc);
+                let state = d.before;
+                let target = self.doc.target;
+                self.start_work("Selecting detected edges…", move || {
+                    let mut doc = Document::from_state(state);
+                    doc.target = target;
+                    let op = FilterOp::begin(&doc).ok_or("The layer cannot be filtered")?;
+                    op.select_edges(&mut doc, &p);
+                    let mask = doc.state.selection.as_deref().cloned()
+                        .unwrap_or_else(|| pf_core::Mask::new(doc.state.width, doc.state.height));
+                    Ok(crate::jobs::Outcome::Selection { mask, mode: pf_core::selection::Combine::Replace, label: "Select Edges" })
+                });
             }
         } else if cancel {
+            self.cancel_work();
             self.filter.take().unwrap().op.cancel(&mut self.doc);
         } else if apply {
             let d = self.filter.take().unwrap();
@@ -414,24 +462,27 @@ impl App {
             d.pending |= changed;
             // Slow filters wait for the slider to be let go.
             if d.pending && (!d.filter.slow() || !ctx.input(|i| i.pointer.any_down())) {
-                d.pending = false;
-                d.op.update(&mut self.doc, &d.filter);
+                self.schedule_filter();
             }
         }
     }
 
     /// Ask before throwing away unsaved work. True means go ahead.
-    fn confirm_discard(&self) -> bool {
+    fn confirm_discard(&mut self) -> bool {
         if !self.doc.modified {
             return true;
         }
-        rfd::MessageDialog::new()
+        let answer = rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Warning)
             .set_title("Unsaved changes")
-            .set_description(format!("\u{201c}{}\u{201d} has unsaved changes. Discard them?", self.doc_name()))
-            .set_buttons(rfd::MessageButtons::OkCancelCustom("Discard".into(), "Cancel".into()))
-            .show()
-            == rfd::MessageDialogResult::Custom("Discard".into())
+            .set_description(format!("Save the changes to {}?", self.doc_name()))
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom("Save".into(), "Discard".into(), "Cancel".into()))
+            .show();
+        match answer {
+            rfd::MessageDialogResult::Custom(label) if label == "Save" => self.save(false),
+            rfd::MessageDialogResult::Custom(label) if label == "Discard" => true,
+            _ => false,
+        }
     }
 
     pub fn open_path(&mut self, path: &Path) {
@@ -442,7 +493,7 @@ impl App {
                 self.store.add_recent(path);
             }
             Err(e) => {
-                self.toast(format!("Couldn't open {}: {e}", path.display()));
+                self.error = Some(format!("Couldn't open {}: {e}", path.display()));
                 if !path.exists() {
                     self.store.remove_recent(path);
                 }
@@ -469,7 +520,7 @@ impl App {
         match io::load_pixmap(path) {
             Ok(px) => {
                 if self.doc.add_image_in_selection(&name, &px).is_none() {
-                    self.toast("Select the area the image should fill first");
+                    self.toast("The selection is empty or the inserted image would exceed the document size limits");
                 }
             }
             Err(e) => self.toast(format!("Couldn't open {}: {e}", path.display())),
@@ -480,13 +531,19 @@ impl App {
         match io::load_pixmap(path) {
             Ok(px) => {
                 let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Layer").to_owned();
-                self.doc.add_image_layer(&name, px);
+                if let Err(e) = self.doc.check_layer_capacity(px.w, px.h) {
+                    return self.error = Some(e.to_string());
+                }
+                let (x, y) = ((self.doc.state.width as i32 - px.w as i32) / 2, (self.doc.state.height as i32 - px.h as i32) / 2);
+                if let Err(e) = self.doc.try_insert_layer("Add Image", Layer::new(name, px, x, y)) {
+                    self.error = Some(e.to_string());
+                }
             }
             Err(e) => self.toast(format!("Couldn't open {}: {e}", path.display())),
         }
     }
 
-    fn save(&mut self, save_as: bool) {
+    fn save(&mut self, save_as: bool) -> bool {
         let path = match (&self.doc.path, save_as) {
             (Some(p), false) => Some(p.clone()),
             _ => rfd::FileDialog::new()
@@ -495,13 +552,16 @@ impl App {
                 .save_file()
                 .map(|p| if io::is_ora(&p) { p } else { p.with_extension("ora") }),
         };
-        let Some(path) = path else { return };
+        let Some(path) = path else { return false };
         match io::save(&mut self.doc, &path) {
             Ok(()) => {
                 self.store.add_recent(&path);
-                self.toast(format!("Saved {}", path.display()))
+                if let Some(recovery) = &mut self.recovery { recovery.clear(); }
+                if let Some(old) = self.recovered_source.take() { old.discard(); }
+                self.toast(format!("Saved {}", path.display()));
+                true
             }
-            Err(e) => self.toast(format!("Save failed: {e}")),
+            Err(e) => { self.error = Some(format!("Save failed: {e}")); false },
         }
     }
 
@@ -530,7 +590,7 @@ impl App {
         }
         // While a filter is being previewed only the view may change.
         let view = matches!(a, Action::ZoomIn | Action::ZoomOut | Action::ZoomFit | Action::Zoom100 | Action::ResetRotation);
-        if self.busy() && !view {
+        if self.mutation_busy() && !view {
             return;
         }
         let active = self.doc.state.active;
@@ -558,9 +618,19 @@ impl App {
                     self.insert_in_selection(&p);
                 }
             }
-            Action::Save => self.save(false),
-            Action::SaveAs => self.save(true),
+            Action::Save => { self.save(false); },
+            Action::SaveAs => { self.save(true); },
             Action::Export => self.export(),
+            Action::ExportCompatible => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("Compatible OpenRaster", &["ora"])
+                    .set_file_name(format!("{}-compatible.ora", self.doc_name())).save_file() {
+                    let path = path.with_extension("ora");
+                    match io::ora::export_compatible(&self.doc.state, &path) {
+                        Ok(()) => self.toast("Exported compatible layers with masks baked into transparency"),
+                        Err(e) => self.error = Some(format!("Export failed: {e}")),
+                    }
+                }
+            },
             Action::Undo => {
                 self.doc.undo();
             }
@@ -578,8 +648,9 @@ impl App {
             }
             Action::Paste => match self.clipboard.clone() {
                 Some(c) => {
-                    self.doc.paste(&c);
-                    self.tool = Tool::Move;
+                    if let Err(e) = self.doc.try_insert_layer("Paste", Layer::new("Pasted Layer", c.pixels, c.x, c.y)) {
+                        self.error = Some(e.to_string());
+                    } else { self.tool = Tool::Move; }
                 }
                 None => self.toast("Nothing to paste"),
             },
@@ -600,13 +671,32 @@ impl App {
                 None => self.toast("Select an area to crop to first"),
             },
             Action::NewLayer => {
-                self.doc.add_empty_layer();
+                match self.doc.check_layer_capacity(self.doc.state.width, self.doc.state.height) {
+                    Ok(()) => { self.doc.add_empty_layer(); }
+                    Err(e) => self.error = Some(e.to_string()),
+                }
             }
-            Action::DuplicateLayer => self.doc.duplicate_layer(active),
+            Action::DuplicateLayer => {
+                if let Some(layer) = self.doc.state.layer(active) {
+                    let mut copy = layer.clone();
+                    copy.id = pf_core::document::next_id();
+                    copy.name = format!("{} copy", copy.name);
+                    if let Err(e) = self.doc.try_insert_layer("Duplicate Layer", copy) { self.error = Some(e.to_string()); }
+                }
+            },
             Action::DeleteLayer => self.doc.delete_layer(active),
-            Action::MergeDown => self.doc.merge_down(active),
+            Action::MergeDown => {
+                if let Err(e) = self.doc.merge_down(active) { self.toast(e.to_string()); }
+            },
             Action::Flatten => self.doc.flatten_image(),
-            Action::AddMask => self.doc.add_mask(active),
+            Action::AddMask => {
+                if let Some(layer) = self.doc.state.layer(active) {
+                    let used: u64 = self.doc.state.layers.iter().map(|l| l.pixels.w as u64 * l.pixels.h as u64 * if l.mask.is_some() { 2 } else { 1 }).sum();
+                    if layer.mask.is_none() && used + layer.pixels.w as u64 * layer.pixels.h as u64 > io::limits::MAX_DOCUMENT_PIXELS {
+                        self.error = Some("The mask would exceed the document pixel budget".to_owned());
+                    } else { self.doc.add_mask(active); }
+                }
+            },
             Action::DeleteMask => self.doc.delete_mask(active),
             Action::ApplyMask => self.doc.apply_mask(active),
             Action::InvertMask => self.doc.invert_mask(active),
@@ -768,6 +858,42 @@ impl App {
         }
     }
 
+    fn recovery_dialog(&mut self, ctx: &Context) {
+        let Some(candidate) = self.recoveries.first() else { return };
+        let name = candidate.original.as_ref().map_or_else(|| "Untitled image".to_owned(), |p| p.display().to_string());
+        let (mut recover, mut discard) = (false, false);
+        egui::Modal::new(egui::Id::new("recover-document")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Recover unsaved work");
+            ui.label(format!("An earlier session stopped with unsaved changes to {name}."));
+            ui.label("Recovery snapshots are saved privately every 30 seconds while the document is idle.");
+            ui.horizontal(|ui| {
+                recover = ui.button("Recover").clicked();
+                discard = ui.button("Discard Recovery").clicked();
+            });
+        });
+        if recover {
+            if !self.confirm_discard() { return; }
+            match self.recoveries[0].load() {
+                Ok(doc) => {
+                    self.set_doc(doc);
+                    // Keep the original recovery until the recovered document is saved
+                    // or discarded; a second crash during recovery must not lose it.
+                    let previous = self.recoveries.remove(0);
+                    if let Some(recovery) = &mut self.recovery {
+                        recovery.tick(&self.doc, true, self.now);
+                    }
+                    self.recovered_source = Some(previous);
+                    self.toast("Recovered unsaved work. Save the document to keep it.");
+                }
+                Err(e) => self.error = Some(format!("Couldn't recover the image: {e}")),
+            }
+        } else if discard {
+            let previous = self.recoveries.remove(0);
+            previous.discard();
+        }
+    }
+
     fn new_doc_dialog(&mut self, ctx: &Context) {
         let Some(nd) = &mut self.new_doc else { return };
         let mut create = false;
@@ -799,7 +925,10 @@ impl App {
         if create {
             let nd = self.new_doc.take().unwrap();
             if self.confirm_discard() {
-                self.set_doc(Document::new(nd.w, nd.h, (!nd.transparent).then_some([255; 4])));
+                match io::limits::validate_dimensions(nd.w, nd.h) {
+                    Ok(_) => self.set_doc(Document::new(nd.w, nd.h, (!nd.transparent).then_some([255; 4]))),
+                    Err(e) => self.error = Some(e.to_string()),
+                }
             }
         } else if close {
             self.new_doc = None;
@@ -811,6 +940,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.now = ctx.input(|i| i.time);
+        self.poll_work(&ctx);
+        self.schedule_perspective();
 
         if self.new_doc.is_none() && self.scale_dlg.is_none() && !self.ai.modal_open() {
             self.shortcuts(&ctx);
@@ -823,25 +954,35 @@ impl eframe::App for App {
             self.text_repath = false;
         }
 
-        // Files dropped on the window become new layers.
-        for f in ctx.input(|i| i.raw.dropped_files.clone()) {
-            {
-                let p = f.path().to_path_buf();
-                if p.as_os_str().is_empty() {
-                    continue;
-                }
+        // Queue drops until an active operation commits or cancels. Never put a
+        // new layer into a document whose preview owns a rollback snapshot.
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter()
+            .map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        if !dropped.is_empty() && self.mutation_busy() {
+            self.toast("Image queued until the current edit finishes");
+        }
+        self.pending_drops.extend(dropped);
+        if !self.mutation_busy() {
+            for p in std::mem::take(&mut self.pending_drops) {
                 if io::is_ora(&p) {
-                    if self.confirm_discard() {
-                        self.open_path(&p);
-                    }
-                } else {
-                    self.add_image(&p);
-                }
+                    if self.confirm_discard() { self.open_path(&p); }
+                } else { self.add_image(&p); }
             }
         }
 
-        if ctx.input(|i| i.viewport().close_requested()) && !self.confirm_discard() {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            // Pending gestures have already changed pixels but have not committed
+            // their dirty/history flag. Keep the window until the edit resolves.
+            if self.busy() || !matches!(self.drag, Drag::None) || self.prop.is_some() || self.layer_drag.is_some() {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.toast("Finish or cancel the current edit before closing");
+            } else if !self.confirm_discard() {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            } else {
+                if let Some(recovery) = &mut self.recovery { recovery.clear(); }
+                if let Some(old) = self.recovered_source.take() { old.discard(); }
+                return;
+            }
         }
 
         let title = format!("{}{}", self.doc_name(), if self.doc.modified { " \u{2014} Edited" } else { "" });
@@ -884,7 +1025,25 @@ impl eframe::App for App {
         self.filter_dialog(&ctx);
         self.perspective_dialog(&ctx);
         self.content_scale_dialog(&ctx);
+        self.work_status(&ctx);
         self.ai_dialogs(&ctx);
+        self.recovery_dialog(&ctx);
+        let stable = !self.mutation_busy();
+        if let Some(recovery) = &mut self.recovery {
+            if let Some(error) = recovery.poll() { self.error = Some(error); }
+            recovery.tick(&self.doc, stable, self.now);
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        if let Some(error) = self.error.clone() {
+            egui::Modal::new(egui::Id::new("document-error")).show(&ctx, |ui| {
+                ui.set_width(420.0);
+                ui.heading("The operation could not be completed");
+                ui.label(error);
+                if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    self.error = None;
+                }
+            });
+        }
 
         if let Some((msg, until)) = &self.toast {
             if self.now < *until {

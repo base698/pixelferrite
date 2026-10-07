@@ -6,11 +6,15 @@ mod fonts;
 mod fxui;
 mod panels;
 mod store;
+mod recovery;
+mod jobs;
 mod tools;
 mod view;
 
 #[cfg(test)]
 mod uitest;
+#[cfg(test)]
+mod app_regressions;
 #[cfg(test)]
 mod demo;
 

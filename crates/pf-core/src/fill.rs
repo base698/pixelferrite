@@ -44,11 +44,16 @@ impl GradientOp {
         let canvas = doc.canvas();
         let target = doc.effective_target();
         let sel = doc.state.selection.clone();
+        let active = doc.state.active_layer()?;
+        let frame = active.rect().union(canvas);
+        doc.check_layer_resize(active.id, frame.width() as u32, frame.height() as u32).ok()?;
         let layer = doc.state.active_layer_mut()?;
         if !layer.visible || layer.locked {
             return None;
         }
-        layer.ensure_covers(canvas);
+        if !layer.ensure_covers(canvas) {
+            return None;
+        }
         if target == Target::Pixels || layer.mask.is_none() {
             layer.text = None;
         }
@@ -160,12 +165,21 @@ pub fn fill_mask(doc: &mut Document, name: &str, cov: &Mask, mode: FillMode, opa
     let before = doc.begin();
     let canvas = doc.canvas();
     let target = doc.effective_target();
+    if matches!(mode, FillMode::Color(_)) {
+        let Some(active) = doc.state.active_layer() else { return false };
+        let frame = active.rect().union(canvas);
+        if doc.check_layer_resize(active.id, frame.width() as u32, frame.height() as u32).is_err() {
+            return false;
+        }
+    }
     let Some(layer) = doc.state.active_layer_mut() else { return false };
     if layer.locked {
         return false;
     }
     if matches!(mode, FillMode::Color(_)) {
-        layer.ensure_covers(canvas);
+        if !layer.ensure_covers(canvas) {
+            return false;
+        }
     }
     let (ox, oy) = (layer.x, layer.y);
     let rect = area.intersect(layer.rect()).translate(-ox, -oy);

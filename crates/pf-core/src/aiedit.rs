@@ -3,7 +3,7 @@
 //! lives in the app; nothing here talks to anything.
 
 use image::imageops::{self, FilterType};
-use image::{GrayImage, RgbaImage};
+use image::{GrayImage, Rgba32FImage};
 
 use crate::buf::{Mask, Pixmap};
 use crate::composite;
@@ -22,6 +22,7 @@ pub enum Source {
 }
 
 /// One edit request: what to send, and where the answer goes.
+#[derive(Clone)]
 pub struct AiJob {
     pub source: Source,
     /// The active layer when the request was made. For [`Source::Layer`] the
@@ -42,8 +43,23 @@ pub(crate) fn resize(p: &Pixmap, w: u32, h: u32, f: FilterType) -> Pixmap {
     if (p.w, p.h) == (w, h) {
         return p.clone();
     }
-    let img = RgbaImage::from_raw(p.w, p.h, p.data.clone()).expect("buffer size");
-    Pixmap::from_raw(w, h, imageops::resize(&img, w, h, f).into_raw())
+    // Interpolating straight RGBA lets invisible RGB leak into visible edges.
+    let data = p.data.chunks_exact(4).flat_map(|p| {
+        let a = p[3] as f32 / 255.0;
+        [p[0] as f32 / 255.0 * a, p[1] as f32 / 255.0 * a, p[2] as f32 / 255.0 * a, a]
+    }).collect();
+    let img = Rgba32FImage::from_raw(p.w, p.h, data).expect("buffer size");
+    let scaled = imageops::resize(&img, w, h, f);
+    let data = scaled.pixels().flat_map(|p| {
+        let a = p[3].clamp(0.0, 1.0);
+        if a <= 0.0 {
+            [0; 4]
+        } else {
+            let color = |c: usize| ((p[c] / a).clamp(0.0, 1.0) * 255.0).round() as u8;
+            [color(0), color(1), color(2), (a * 255.0).round() as u8]
+        }
+    }).collect();
+    Pixmap::from_raw(w, h, data)
 }
 
 /// Build a request from the visible image or from the active layer. With a
@@ -180,26 +196,45 @@ fn fill_empty(px: &mut Pixmap) {
     }
 }
 
-impl Document {
-    /// Place a model's answer to `job` as a new layer, scaled to the area that
-    /// was sent: above the layer it came from, or on top of everything when
-    /// the whole visible image was sent.
-    pub fn insert_ai_result(&mut self, job: &AiJob, result: &Pixmap, name: &str) -> LayerId {
-        let r = job.rect;
+impl AiJob {
+    /// Final layer bounds after trimming the selection, without allocating
+    /// or resizing the generated image.
+    pub fn result_rect(&self) -> IRect {
+        match &self.clip {
+            Some(clip) => selection::bounds(clip).unwrap_or(IRect::xywh(0, 0, 1, 1)).translate(self.rect.x0, self.rect.y0),
+            None => self.rect,
+        }
+    }
+
+    /// Prepare the exact layer that will be inserted, including scaling,
+    /// selection feathering and its document position. This also lets request
+    /// history save the final layer without changing a document.
+    pub fn result_layer(&self, result: &Pixmap, name: &str) -> Layer {
+        let r = self.rect;
         let mut px = resize(result, r.width() as u32, r.height() as u32, FilterType::Lanczos3);
         let mut area = px.rect();
-        if let Some(clip) = &job.clip {
+        if let Some(clip) = &self.clip {
             for (p, c) in px.data.chunks_exact_mut(4).zip(&clip.data) {
                 p[3] = ((p[3] as u32 * *c as u32 + 127) / 255) as u8;
             }
             area = selection::bounds(clip).unwrap_or(IRect::xywh(0, 0, 1, 1));
             px = px.reframed(area, [0; 4]);
         }
+        Layer::new(name, px, r.x0 + area.x0, r.y0 + area.y0)
+    }
+}
+
+impl Document {
+    /// Place a model's answer to `job` as a new layer, scaled to the area that
+    /// was sent: above the layer it came from, or on top of everything when
+    /// the whole visible image was sent.
+    pub fn insert_ai_result(&mut self, job: &AiJob, result: &Pixmap, name: &str) -> LayerId {
+        let layer = job.result_layer(result, name);
         match job.source {
             Source::Layer if self.state.layer(job.layer).is_some() => self.state.active = job.layer,
             Source::Layer => {}
             Source::Visible => self.state.active = self.state.layers.last().map_or(self.state.active, |l| l.id),
         }
-        self.insert_layer("AI Edit", Layer::new(name, px, r.x0 + area.x0, r.y0 + area.y0))
+        self.insert_layer("AI Edit", layer)
     }
 }

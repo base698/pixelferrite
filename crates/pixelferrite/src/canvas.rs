@@ -453,6 +453,19 @@ fn press(app: &mut App, p: Pos2, mods: Modifiers) {
             let key = region_key(app);
             if app.regions.as_ref().is_none_or(|(k, _)| *k != key) {
                 let Some(src) = fill::sample_source(&app.doc.state, app.settings.sample_all_layers) else { return };
+                if src.w as u64 * src.h as u64 > 1_000_000 {
+                    let detail = app.settings.region_detail;
+                    let mode = combine_mode(mods, app.settings.sel_mode);
+                    let point = (p.x, p.y);
+                    let (w, h) = (app.doc.state.width, app.doc.state.height);
+                    app.start_work("Finding image regions…", move || {
+                        let regions = segment::watershed(&src, detail);
+                        let labels: Vec<u32> = regions.label_at(point.0, point.1).into_iter().collect();
+                        let mask = regions.mask(&labels, w, h);
+                        Ok(crate::jobs::Outcome::Regions { regions, key, mask, mode })
+                    });
+                    return;
+                }
                 app.regions = Some((key, segment::watershed(&src, app.settings.region_detail)));
             }
             let mode = combine_mode(mods, app.settings.sel_mode);
@@ -517,7 +530,9 @@ fn dragged(app: &mut App, p: Pos2, screen: Pos2, inp: &Input) {
         }
         Drag::Move { start, orig, moved, .. } => {
             let d = p - *start;
-            let (nx, ny) = (orig.0 + d.x.round() as i32, orig.1 + d.y.round() as i32);
+            let limit = pf_core::io::limits::MAX_LAYER_OFFSET;
+            let nx = orig.0.saturating_add(d.x.round() as i32).clamp(-limit, limit);
+            let ny = orig.1.saturating_add(d.y.round() as i32).clamp(-limit, limit);
             if let Some(l) = app.doc.state.active_layer_mut() {
                 if (l.x, l.y) != (nx, ny) {
                     let old = l.rect();
@@ -610,7 +625,18 @@ fn release(app: &mut App) {
                 return;
             }
             let Some(src) = fill::sample_source(&app.doc.state, app.settings.sample_all_layers) else { return };
-            let found = segment::grabcut(&src, IRect::enclosing(r.min.x, r.min.y, r.max.x, r.max.y));
+            let bounds = IRect::enclosing(r.min.x, r.min.y, r.max.x, r.max.y);
+            if src.w as u64 * src.h as u64 > 1_000_000 {
+                app.start_work("Selecting the subject…", move || {
+                    let mask = segment::grabcut(&src, bounds);
+                    if selection::bounds(&mask).is_none() {
+                        return Err("Couldn't tell a subject from its background. Try a tighter box.".to_owned());
+                    }
+                    Ok(crate::jobs::Outcome::Selection { mask, mode, label: "Select Subject" })
+                });
+                return;
+            }
+            let found = segment::grabcut(&src, bounds);
             if selection::bounds(&found).is_none() {
                 return app.toast("Couldn't tell a subject from its background there. Try a tighter box.");
             }
@@ -667,8 +693,7 @@ pub fn cancel(app: &mut App) {
             app.doc.mark_all_dirty();
         }
         Drag::Stroke(s) => {
-            s.finish(&mut app.doc);
-            app.doc.undo();
+            s.cancel(&mut app.doc);
         }
         _ => {}
     }

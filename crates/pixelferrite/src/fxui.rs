@@ -3,7 +3,7 @@
 //! turning a selection's outline into a text path.
 
 use egui::{Context, Key, RichText, vec2};
-use pf_core::segment;
+use pf_core::{DocState, Document, segment};
 use pf_core::text::{self, TextSpec};
 use pf_core::transform::{PerspectiveMode, PerspectiveOp, Quad};
 
@@ -17,9 +17,28 @@ pub struct Warp {
     pub mode: PerspectiveMode,
     /// The corner being dragged.
     pub grab: Option<usize>,
+    generation: u64,
+    pending: bool,
+    valid: bool,
+    ready: Option<(u64, DocState)>,
 }
 
 impl Warp {
+    fn can_apply(&self) -> bool {
+        !self.pending && self.grab.is_none() && self.ready.as_ref().is_some_and(|(generation, _)| *generation == self.generation)
+    }
+
+    fn large(&self) -> bool {
+        let frame = self.op.frame;
+        let input = frame.width() as u64 * frame.height() as u64;
+        let output = if self.mode == PerspectiveMode::Distort {
+            let (x0, x1) = self.quad.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p.0 as f64), a.1.max(p.0 as f64)));
+            let (y0, y1) = self.quad.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p.1 as f64), a.1.max(p.1 as f64)));
+            ((x1.ceil() - x0.floor()) * (y1.ceil() - y0.floor())).max(0.0) as u64
+        } else { input };
+        input > 100_000 || output > 100_000
+    }
+
     fn start_quad(op: &PerspectiveOp, mode: PerspectiveMode) -> Quad {
         let c = op.corners();
         match mode {
@@ -44,19 +63,78 @@ impl App {
         match PerspectiveOp::begin(&self.doc) {
             Some(op) => {
                 let mode = PerspectiveMode::Distort;
-                self.warp = Some(Warp { quad: Warp::start_quad(&op, mode), op, mode, grab: None });
+                let generation = pf_core::document::next_id();
+                self.warp = Some(Warp {
+                    quad: Warp::start_quad(&op, mode), op, mode, grab: None,
+                    generation, pending: false, valid: true, ready: Some((generation, self.doc.begin())),
+                });
             }
             None => self.toast("This layer is hidden, locked or too small"),
         }
     }
 
-    /// Re-render the preview after a corner moved (distort only; straighten
-    /// shows just the outline until applied).
+    /// Keep only the latest requested corners while a preview is rendering.
     pub fn warp_changed(&mut self) {
         if let Some(w) = &mut self.warp {
+            w.generation = pf_core::document::next_id();
+            w.pending = true;
+            w.valid = true;
+            w.ready = None;
+        }
+        self.schedule_perspective();
+    }
+
+    /// Start one preview at a time; corners moved while it runs replace the
+    /// pending request rather than queuing obsolete full-image computations.
+    pub fn schedule_perspective(&mut self) {
+        if self.work.is_some() { return; }
+        let Some(w) = &mut self.warp else { return };
+        if !w.pending { return; }
+        w.pending = false;
+        let generation = w.generation;
+        let (quad, mode, large) = (w.quad, w.mode, w.large());
+        let mut op = w.op.clone();
+        let state = self.doc.begin();
+        let render = move || {
+            let mut doc = Document::from_state(state);
+            let state = op.update(&mut doc, quad, mode).then_some(doc.state);
+            Ok(crate::jobs::Outcome::Perspective { generation, state })
+        };
+        if large {
+            self.start_work("Rendering perspective preview…", render);
+        } else if let Ok(crate::jobs::Outcome::Perspective { generation, state }) = render() {
+            self.accept_perspective_preview(generation, state);
+        }
+    }
+
+    pub fn accept_perspective_preview(&mut self, generation: u64, state: Option<DocState>) {
+        let Some(w) = &mut self.warp else { return };
+        if w.generation != generation { return; }
+        w.valid = state.is_some();
+        if let Some(state) = state {
+            // Straightening keeps the original image under the handles until
+            // Apply, so the user can continue identifying the source corners.
             if w.mode == PerspectiveMode::Distort {
-                w.op.update(&mut self.doc, w.quad, w.mode);
+                self.doc.state = state.clone();
+                self.doc.mark_all_dirty();
             }
+            w.ready = Some((generation, state));
+        }
+    }
+
+    pub fn cancel_perspective(&mut self) {
+        self.cancel_work();
+        if let Some(w) = self.warp.take() {
+            w.op.cancel(&mut self.doc);
+        }
+    }
+
+    fn apply_perspective(&mut self) {
+        if !self.warp.as_ref().is_some_and(Warp::can_apply) { return; }
+        if let Some(w) = self.warp.take() {
+            self.doc.state = w.ready.unwrap().1;
+            self.doc.mark_all_dirty();
+            w.op.finish(&mut self.doc);
         }
     }
 
@@ -64,6 +142,7 @@ impl App {
         let Some(w) = &mut self.warp else { return };
         let (mut apply, mut cancel) = (false, false);
         let was = w.mode;
+        let can_apply = w.can_apply();
         egui::Window::new("Perspective").collapsible(false).resizable(false).default_pos(self.view.vp.left_bottom() + vec2(16.0, -170.0)).show(ctx, |ui| {
             ui.set_width(270.0);
             ui.horizontal(|ui| {
@@ -75,30 +154,30 @@ impl App {
                 PerspectiveMode::Straighten => "Put the four handles on the corners of something that should be square-on (a page, a screen, a building front), then Apply.",
             };
             ui.label(RichText::new(hint).small().weak());
+            if !w.valid {
+                ui.label(RichText::new("Those corners don't make a usable shape or exceed the image limits.").small());
+            } else if !can_apply {
+                ui.label(RichText::new("Preparing the latest preview…").small().weak());
+            }
             ui.add_space(8.0);
             ui.allocate_ui_with_layout(vec2(270.0, 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                apply = ui.button("Apply").clicked();
+                apply = ui.add_enabled(can_apply, egui::Button::new("Apply")).clicked();
                 cancel = ui.button("Cancel").clicked();
             });
         });
-        apply |= ctx.input(|i| i.key_pressed(Key::Enter));
+        apply |= can_apply && ctx.input(|i| i.key_pressed(Key::Enter));
         cancel |= ctx.input(|i| i.key_pressed(Key::Escape));
         if w.mode != was {
             // Switching mode starts over from the untouched layer.
             w.quad = Warp::start_quad(&w.op, w.mode);
-            let (quad, _) = (w.op.corners(), ());
-            w.op.update(&mut self.doc, quad, PerspectiveMode::Distort);
+            w.op.clone().cancel(&mut self.doc);
+            self.warp_changed();
+            apply = false;
         }
         if cancel {
-            self.warp.take().unwrap().op.cancel(&mut self.doc);
+            self.cancel_perspective();
         } else if apply {
-            let mut w = self.warp.take().unwrap();
-            if w.op.update(&mut self.doc, w.quad, w.mode) {
-                w.op.finish(&mut self.doc);
-            } else {
-                w.op.cancel(&mut self.doc);
-                self.toast("Those corners don't make a usable shape");
-            }
+            self.apply_perspective();
         }
     }
 
@@ -136,11 +215,23 @@ impl App {
         });
         if apply {
             let d = self.scale_dlg.take().unwrap();
-            if self.doc.content_aware_scale(d.w, d.h) {
-                self.fit_pending = true;
-            }
+            self.apply_content_scale(d.w, d.h);
         } else if close {
             self.scale_dlg = None;
+        }
+    }
+
+    fn apply_content_scale(&mut self, width: u32, height: u32) {
+        let before = self.doc.begin();
+        let pixels = before.active_layer().map_or(0, |l| l.pixels.w as u64 * l.pixels.h as u64);
+        if pixels <= 100_000 {
+            if self.doc.content_aware_scale(width, height) { self.fit_pending = true; }
+        } else {
+            self.start_work("Content-aware scaling…", move || {
+                let mut doc = pf_core::Document::from_state(before);
+                if !doc.content_aware_scale(width, height) { return Err("The layer could not be scaled".to_owned()); }
+                Ok(crate::jobs::Outcome::Edit { state: doc.state, label: "Content-Aware Scale" })
+            });
         }
     }
 
@@ -167,5 +258,91 @@ impl App {
             }
         }
         self.tool = Tool::Text;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use egui_kittest::Harness;
+    use pf_core::{Layer, Pixmap};
+
+    fn harness() -> Harness<'static, App> {
+        Harness::builder().with_size(egui::vec2(1400.0, 880.0)).build_eframe(|cc| {
+            let mut app = App::new(cc, None);
+            app.doc = Document::new(512, 512, Some([255, 0, 0, 255]));
+            app
+        })
+    }
+
+    fn finish(h: &mut Harness<'_, App>) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while h.state().work.is_some() || h.state().warp.as_ref().is_some_and(|w| w.pending) {
+            assert!(Instant::now() < deadline, "geometry work did not finish");
+            h.step();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn large_perspective_coalesces_previews_and_cancel_preserves_history() {
+        let mut h = harness();
+        h.state_mut().open_perspective();
+        let original = h.state().doc.begin();
+        let revision = h.state().doc.revision();
+        let first = [(10.0, 0.0), (522.0, 0.0), (522.0, 512.0), (10.0, 512.0)];
+        let latest = [(25.0, 30.0), (537.0, 30.0), (537.0, 542.0), (25.0, 542.0)];
+        h.state_mut().warp.as_mut().unwrap().quad = first;
+        h.state_mut().warp_changed();
+        assert!(h.state().work.is_some());
+        let first_generation = h.state().warp.as_ref().unwrap().generation;
+        assert!(!h.state().warp.as_ref().unwrap().can_apply());
+        h.state_mut().warp.as_mut().unwrap().quad = latest;
+        h.state_mut().warp_changed();
+        assert!(h.state().warp.as_ref().unwrap().pending);
+        // Even a completed earlier job cannot enable Apply or replace pixels.
+        h.state_mut().accept_perspective_preview(first_generation, Some(original.clone()));
+        assert!(!h.state().warp.as_ref().unwrap().can_apply());
+        h.state_mut().apply_perspective();
+        assert!(h.state().warp.is_some());
+        assert_eq!(h.state().doc.revision(), revision);
+        finish(&mut h);
+        assert!(h.state().warp.as_ref().unwrap().can_apply());
+        let layer = h.state().doc.state.active_layer().unwrap();
+        assert_eq!((layer.x, layer.y), (25, 30));
+        h.state_mut().apply_perspective();
+        assert_eq!(h.state().doc.history().0.last(), Some("Perspective"));
+        assert!(h.state_mut().doc.undo());
+        assert_eq!(h.state().doc.state.active_layer().unwrap().rect(), original.active_layer().unwrap().rect());
+
+        // Cancelling another worker restores the snapshot and retains redo.
+        h.state_mut().open_perspective();
+        let revision = h.state().doc.revision();
+        let history_position = h.state().doc.history().1;
+        h.state_mut().warp.as_mut().unwrap().quad = first;
+        h.state_mut().warp_changed();
+        assert!(h.state().work.is_some());
+        h.state_mut().cancel_perspective();
+        finish(&mut h);
+        assert!(h.state().warp.is_none());
+        assert_eq!(h.state().doc.revision(), revision);
+        assert_eq!(h.state().doc.history().1, history_position);
+        assert_eq!(h.state().doc.state.active_layer().unwrap().pixels.data, original.active_layer().unwrap().pixels.data);
+        assert!(h.state_mut().doc.redo());
+    }
+
+    #[test]
+    fn large_layer_on_small_canvas_scales_in_the_background() {
+        let mut h = harness();
+        h.state_mut().doc = Document::new(16, 16, None);
+        h.state_mut().doc.insert_layer("Image", Layer::new("Large", Pixmap::filled(512, 512, [255; 4]), 0, 0));
+        h.state_mut().apply_content_scale(511, 512);
+        assert!(h.state().work.is_some());
+        assert_eq!(h.state().doc.state.active_layer().unwrap().pixels.w, 512);
+        finish(&mut h);
+        assert_eq!(h.state().doc.state.active_layer().unwrap().pixels.w, 511);
+        assert_eq!((h.state().doc.state.width, h.state().doc.state.height), (16, 16));
+        assert_eq!(h.state().doc.history().0.last(), Some("Content-Aware Scale"));
     }
 }

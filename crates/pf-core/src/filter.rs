@@ -171,7 +171,11 @@ impl FilterOp {
             // Give layers smaller than the canvas room for the effect to
             // spread into; a layer that fills the canvas keeps its edges.
             if !old_rect.contains_rect(canvas) {
-                layer.ensure_covers(old_rect.expand(margin).intersect(canvas.union(old_rect)));
+                let frame = old_rect.expand(margin).intersect(canvas.union(old_rect));
+                if doc.check_layer_resize(self.layer, frame.width() as u32, frame.height() as u32).is_err()
+                    || !layer.ensure_covers(frame) {
+                    return;
+                }
             }
         }
         let (ox, oy) = (layer.x, layer.y);
@@ -286,12 +290,20 @@ fn apply<const C: usize>(
             }
             let v = &data[(sy * w + (x - src.x0) as usize) * C..][..C];
             let out = &mut row[x as usize * C..][..C];
-            let inv = if premul { if v[C - 1] > 0.0 { 255.0 / v[C - 1] } else { 0.0 } } else { 1.0 };
-            for c in 0..C {
-                let n = if premul && c == C - 1 { v[c] } else { v[c] * inv };
-                // Fully transparent results keep the old colour so nothing bleeds in later.
-                let n = if premul && c != C - 1 && inv == 0.0 { out[c] as f32 } else { n };
-                out[c] = (out[c] as f32 + (n - out[c] as f32) * k + 0.5).clamp(0.0, 255.0) as u8;
+            if premul {
+                let old_alpha = out[C - 1] as f32 / 255.0;
+                let alpha = old_alpha * (1.0 - k) + v[C - 1].clamp(0.0, 255.0) / 255.0 * k;
+                if alpha > 0.0 {
+                    for c in 0..C - 1 {
+                        let color = out[c] as f32 * old_alpha * (1.0 - k) + v[c] * k;
+                        out[c] = (color / alpha).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+                out[C - 1] = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+            } else {
+                for c in 0..C {
+                    out[c] = (out[c] as f32 + (v[c] - out[c] as f32) * k).round().clamp(0.0, 255.0) as u8;
+                }
             }
         }
     });

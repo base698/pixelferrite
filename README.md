@@ -42,7 +42,7 @@
   <tr>
     <td width="25%" valign="top">
       <h3>Small on purpose</h3>
-      The tools you reach for every day, in the places a Pixelmator user expects them: layers on the left, tools on the right, options beside them. About ten thousand lines of Rust.
+      The tools you reach for every day, in the places a Pixelmator user expects them: layers on the left, tools on the right, options beside them. A compact Rust engine and native interface.
     </td>
     <td width="25%" valign="top">
       <h3>AI where you point</h3>
@@ -54,7 +54,7 @@
     </td>
     <td width="25%" valign="top">
       <h3>Open files</h3>
-      Documents are OpenRaster (<code>.ora</code>), which Krita, GIMP and MyPaint also open. Export to PNG, JPEG or GIF.
+      Editable documents use OpenRaster (<code>.ora</code>). Export to PNG, JPEG, GIF or a compatible ORA with masks baked in.
     </td>
   </tr>
 </table>
@@ -84,7 +84,7 @@ light and colour around them.
       <br>
       <sub>Layer > AI Requests…: what was sent, what came back, and how long it took.</sub>
       <h3>Keep the receipts</h3>
-      Every request is saved with its prompt, the exact image and mask that were sent, and the answer. Add an old result back as a layer, reuse a prompt, or open the files.
+      When history is enabled, requests are saved with their prompt, source image, mask, answer and exact inserted layer. Add an old result back as a layer, reuse a prompt, or open the files.
     </td>
   </tr>
   <tr>
@@ -106,7 +106,7 @@ light and colour around them.
 </table>
 
 You bring your own OpenAI key (File > Settings, or a `.env` file). Each request is one paid API call and the picture
-is uploaded to OpenAI; nothing is sent until you press Send.
+is uploaded to the destination shown in the prompt dialog; nothing is sent until you press Send.
 
 ## Select what you mean
 
@@ -177,20 +177,20 @@ development or colour management yet, and text is typed in the side panel instea
 
 ## Get started
 
-You need a [Rust toolchain](https://rustup.rs).
+You need [Rust](https://rustup.rs) 1.98.0, pinned in `rust-toolchain.toml`. Builds and checks use `Cargo.lock`.
 
 ```sh
 git clone https://github.com/base698/pixelferrite
 cd pixelferrite
-cargo run --release -p pixelferrite                # empty canvas
-cargo run --release -p pixelferrite -- photo.jpg   # open a picture
+cargo run --release --locked -p pixelferrite                # empty canvas
+cargo run --release --locked -p pixelferrite -- photo.jpg   # open a picture
 ```
 
 **macOS:** `./scripts/bundle-macos.sh` builds `dist/Pixelferrite.app` and puts a shortcut on the Desktop. The app is
 built for your own machine and signed ad hoc; it is not notarized for handing to others.
 
 **Linux:** the same commands, with the usual winit and wgpu system packages (X11 or Wayland development libraries
-and a Vulkan or GL driver). File dialogs go through the XDG desktop portal. Development so far has been on macOS, so
+and a Vulkan or GL driver), plus FreeType and fontconfig development packages for window titles. File dialogs go through the XDG desktop portal. Development so far has been on macOS, so
 expect rough edges and please report them.
 
 **AI edits** need an OpenAI key. Put it in File > Settings, or in a `.env` file next to where you run the app:
@@ -210,7 +210,7 @@ The vision algorithms are the classics, written in Rust instead of linked from O
 and non-local-means smoothing, CLAHE, GrabCut, watershed, seam carving and homography warps.
 
 ```sh
-cargo test                       # engine tests, plus UI tests that drive the real app offscreen
+cargo test --workspace --locked   # engine and application tests; no paid API calls
 ```
 
 The README screenshots come from the same harness. With the three paintings in a folder:
@@ -229,8 +229,28 @@ The native format is [OpenRaster](https://www.openraster.org/) (`.ora`), which
 Krita, GIMP and MyPaint also open. Layer masks are stored as extra PNGs inside
 the archive that other apps ignore, and text layers carry their text, font and
 path as extra attributes so they stay editable (other apps see the rendered
-pixels). Export writes PNG, JPEG or GIF. Undo history lives in memory for the
-session and is not written to the file.
+pixels). Use **File > Export Compatible ORA…** for interchange: masks are baked
+into layer alpha, and editable text metadata is removed. Keep a native `.ora`
+copy when you need editable masks or text. PNG, JPEG and GIF exports flatten the image.
+
+Nested groups and unsupported stack effects are rejected with an explanation;
+flatten those groups in the source editor first. They are never silently
+reinterpreted. ZIP64 archives are outside the supported format limits.
+
+Inputs and new documents are limited to 16,384 pixels per side, 33,554,432
+pixels per buffer, 67,108,864 total layer/mask/selection pixels, and 256 layers.
+Archives have additional compressed, expanded, entry and XML limits. Oversized
+inputs fail before raster allocation. These are resource bounds, not a promise
+that every permitted operation fits every machine.
+
+Undo history lives in memory, with a 200-step / 1 GiB retained-allocation budget;
+oldest entries are evicted when either limit is reached. It is not saved in the document.
+
+Unsaved stable edits are snapshotted privately in the background at most once
+every 30 seconds. After a crash, the next launch offers **Recover** or **Discard
+Recovery**. Active windows retain their own sessions. Saving or deliberately
+discarding an image removes its recovery snapshot. Recovery is best-effort:
+changes since the last snapshot still require a manual save to survive.
 
 ### Text
 
@@ -242,7 +262,12 @@ Painting on a text layer, or filtering it, turns it into ordinary pixels.
 ### Filters
 
 Filters live in the Filter menu and preview on the canvas until you press
-Apply. They affect the active layer (or its mask when that is being edited),
+Apply. Large previews and expensive filters run in a background worker with a
+cancel control. Content-aware scale and large smart selections also use the
+worker. Cancellation immediately discards the result and releases the editor;
+the current computation may finish in the background before another heavy job
+can start. A result from an older document revision cannot overwrite newer edits.
+They affect the active layer (or its mask when that is being edited),
 limited to the selection if there is one. To add one, add a variant to
 `Filter` in `crates/pf-core/src/filter.rs` and its controls to
 `App::filter_dialog`.
@@ -269,18 +294,26 @@ there is no native library to install.
 ### AI edits
 
 Layer > "Send to AI with Prompt…" (also in a layer's right-click menu) asks
-for a prompt and sends the active layer to OpenAI's image model; the answer
+for a prompt and sends everything visible by default (or the active layer, if selected); the answer
 comes back as a new layer above it. With a selection, only the selected area
 (plus some surroundings for context) is sent, and only the selection is
 replaced, scaled to fit.
 
-The prompt dialog shows exactly what will be sent. Every request is kept, with
-the image that was sent, the mask and the answer: Layer > "AI Requests…" lists
-them and can add an old result back as a layer or reuse its prompt.
+The prompt dialog shows the upload and its actual destination. When history is
+enabled, Layer > "AI Requests…" lists the sent image, mask and answer, and can
+restore the exact clipped layer or reuse its prompt. Older selected requests
+without an exact saved layer cannot be reinserted automatically; Show Files
+still exposes their original output. **Discard when ready** prevents insertion
+but does not cancel the provider request or its billing.
 
-Set the key in File > Settings, or in a `.env` file in the directory you run
-from (or any parent). Each setting is taken from `.env` first, then the
-settings file, then the shell environment:
+Credential precedence is saved settings first, then the shell environment,
+then `.env` in the current working directory only. A key and its endpoint stay
+together: `.env` cannot redirect a saved or shell key, and its own fallback key
+always uses official OpenAI. Parent and executable directories are not searched.
+Changing a saved endpoint clears its old key and requires entering the key again.
+Remote endpoints require HTTPS; plain HTTP is allowed only for loopback development.
+
+For a local OpenAI fallback:
 
 ```
 OPENAI_API_KEY=sk-...
@@ -309,6 +342,8 @@ selection's shape, as a new layer.
   ai/<date>-<time>-<id>/           one folder per AI request
     request.json                   prompt, model, size, layer, area, status, timing, usage
     input.png  mask.png  output.png
+    result.png                     exact clipped layer and placement in request.json
+  recovery/<session>/             private unsaved-document snapshots
 ```
 
 `config.toml`:
@@ -316,13 +351,34 @@ selection's shape, as a new layer.
 ```toml
 [ai]
 api_key = "sk-..."
+api_key_origin = "https://api.openai.com" # maintained by Settings
 model = ""          # empty = gpt-image-2
 quality = ""        # low | medium | high, empty = automatic
 base_url = ""       # empty = OpenAI
-keep_history = 200  # AI requests to keep
+keep_history = 200  # 0 disables history and deletes retained requests
 ```
 
 `PIXELFERRITE_CONFIG_DIR` and `PIXELFERRITE_DATA_DIR` move the two folders.
+Directories are owner-only (`0700`) and private files are `0600` on Unix.
+The key is stored in plaintext with those permissions; it is not encrypted or
+stored in the system keychain. Set history retention to **0** to disable storage,
+or use **Clear All** in AI Requests to erase it. Clearing history also prevents
+requests already running from recreating deleted history.
+
+### Verification and maintenance
+
+[The verification guide](docs/VERIFICATION.md) maps each review finding to its
+regression test and gives application-level checks. CI runs core and offscreen
+GUI tests on macOS and Linux, builds the macOS bundle, and checks RustSec advisories
+on dependency changes and weekly. The bounded malformed-file mutation test runs
+in the normal suite; it supplements rather than replaces continuous fuzzing.
+Known vulnerabilities and unmaintained dependencies fail the advisory job.
+The text engine uses maintained Skrifa font parsing; Linux title decorations
+use FreeType/fontconfig.
+
+This repository has no project license grant yet. The bundle remains locally
+signed and unnotarized; public distribution needs an explicit licensing decision
+and a signed/notarized release process.
 
 ### Controls
 

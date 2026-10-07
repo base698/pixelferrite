@@ -2,10 +2,11 @@
 name = "pixelferrite"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.98"
 
 [dependencies]
 base64 = "0.23.1"
-eframe = "0.36.2"
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "links", "wayland", "web_screen_reader", "wgpu", "x11"] }
 egui = "0.36.2"
 egui-phosphor = "0.14.0"
 epaint_default_fonts = "0.36.2"
@@ -16,6 +17,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = "1.1.6"
 ureq = "3.4.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Keep Wayland window titles while avoiding ab_glyph's unmaintained font parser.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland-dlopen", "wayland-csd-adwaita-crossfont"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36.2", features = ["wgpu", "eframe"] }

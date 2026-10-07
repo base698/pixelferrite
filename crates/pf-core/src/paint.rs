@@ -78,11 +78,16 @@ impl Stroke {
             target = Target::Pixels;
         }
         let sel = doc.state.selection.clone();
+        let active = doc.state.active_layer()?;
+        let frame = active.rect().union(canvas);
+        doc.check_layer_resize(active.id, frame.width() as u32, frame.height() as u32).ok()?;
         let layer = doc.state.active_layer_mut()?;
         if !layer.visible || layer.locked {
             return None;
         }
-        layer.ensure_covers(canvas);
+        if !layer.ensure_covers(canvas) {
+            return None;
+        }
         if target == Target::Pixels {
             layer.text = None;
         }
@@ -155,6 +160,12 @@ impl Stroke {
     /// Finish the stroke and record it as one undo step.
     pub fn finish(self, doc: &mut Document) {
         doc.commit_patch(self.kind.name(), self.before, self.layer, self.target, self.dirty);
+    }
+
+    /// Discard an unfinished stroke without adding or removing history.
+    pub fn cancel(self, doc: &mut Document) {
+        doc.state = self.before;
+        doc.mark_all_dirty();
     }
 
     #[inline]

@@ -69,6 +69,7 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
             item(app, ui, "Save", &cmd("S"), Action::Save);
             item(app, ui, "Save As…", &cmd("⇧S"), Action::SaveAs);
             item(app, ui, "Export PNG / JPEG / GIF…", &cmd("⇧E"), Action::Export);
+            item(app, ui, "Export Compatible OpenRaster…", "", Action::ExportCompatible);
             ui.separator();
             item(app, ui, "Settings…", "", Action::Settings);
         });
@@ -434,9 +435,9 @@ pub fn inspector(app: &mut App, ui: &mut Ui) {
                 let mut moved = None;
                 ui.horizontal(|ui| {
                     ui.label("X:");
-                    let rx = ui.add(egui::DragValue::new(&mut l.x).suffix(" px"));
+                    let rx = ui.add_enabled(!l.locked, egui::DragValue::new(&mut l.x).range(-pf_core::io::limits::MAX_LAYER_OFFSET..=pf_core::io::limits::MAX_LAYER_OFFSET).suffix(" px"));
                     ui.label("Y:");
-                    let ry = ui.add(egui::DragValue::new(&mut l.y).suffix(" px"));
+                    let ry = ui.add_enabled(!l.locked, egui::DragValue::new(&mut l.y).range(-pf_core::io::limits::MAX_LAYER_OFFSET..=pf_core::io::limits::MAX_LAYER_OFFSET).suffix(" px"));
                     moved = Some((rx, ry));
                 });
                 let (mut locked, mut visible) = (l.locked, l.visible);
@@ -865,12 +866,14 @@ pub fn layers(app: &mut App, ui: &mut Ui) {
     ui.separator();
     egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 2)).show(ui, |ui| {
         ui.label(RichText::new(format!("{}  History", icon::CLOCK_COUNTER_CLOCKWISE)).strong());
+        ui.label(RichText::new(format!("{:.1} MiB retained", app.doc.history_bytes() as f64 / (1024.0 * 1024.0))).small().color(DIM))
+            .on_hover_text("Undo retains at most 200 steps and 1 GiB of extra raster data. Older steps are dropped when either limit is reached.");
         let (names, pos) = app.doc.history();
         let names: Vec<String> = names.map(str::to_owned).collect();
         let mut jump = None;
         egui::ScrollArea::vertical().id_salt("history").auto_shrink(false).stick_to_bottom(true).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            if ui.selectable_label(pos == 0, RichText::new("Original").color(DIM)).clicked() {
+            if ui.selectable_label(pos == 0, RichText::new("Start of retained history").color(DIM)).clicked() {
                 jump = Some(0);
             }
             for (i, name) in names.iter().enumerate() {

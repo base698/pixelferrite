@@ -2,10 +2,11 @@
 name = "pf-core"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.98"
 
 [dependencies]
-ab_glyph = "0.2.32"
 ab_glyph_rasterizer = "0.1.10"
+skrifa = { version = "0.44.0", default-features = false, features = ["std"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 rayon = "1.12.0"
 roxmltree = "0.21.1"
@@ -13,5 +14,4 @@ thiserror = "2.0.21"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-ab_glyph = "0.2.32"
 epaint_default_fonts = "0.36.2"

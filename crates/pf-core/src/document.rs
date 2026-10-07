@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -74,20 +75,37 @@ impl Layer {
     }
 
     /// Grow the layer's buffers so they cover `r` (document space).
-    pub fn ensure_covers(&mut self, r: IRect) {
+    /// Returns false without changing the layer if the larger frame exceeds
+    /// the image limits.
+    pub fn ensure_covers(&mut self, r: IRect) -> bool {
+        if self.x.checked_add(self.pixels.w as i32).is_none() || self.y.checked_add(self.pixels.h as i32).is_none() {
+            return false;
+        }
         let cur = self.rect();
         if cur.contains_rect(r) {
-            return;
+            return true;
         }
         let new = cur.union(r);
+        let (w, h) = (new.x1 as i64 - new.x0 as i64, new.y1 as i64 - new.y0 as i64);
+        if w <= 0 || h <= 0 || w > u32::MAX as i64 || h > u32::MAX as i64
+            || crate::io::limits::validate_dimensions(w as u32, h as u32).is_err()
+            || new.x0.unsigned_abs() > crate::io::limits::MAX_LAYER_OFFSET as u32
+            || new.y0.unsigned_abs() > crate::io::limits::MAX_LAYER_OFFSET as u32 {
+            return false;
+        }
         let local = new.translate(-self.x, -self.y);
         self.pixels = Arc::new(self.pixels.reframed(local, [0; 4]));
         if let Some(m) = &self.mask {
             self.mask = Some(Arc::new(m.reframed(local, [255])));
         }
-        self.x = new.x0;
-        self.y = new.y0;
+        if let Some(text) = &mut self.text {
+            let text = Arc::make_mut(text);
+            text.raster.0 += new.x0 - self.x;
+            text.raster.1 += new.y0 - self.y;
+        }
+        (self.x, self.y) = (new.x0, new.y0);
         self.touch();
+        true
     }
 
     /// Mask coverage (0..=255) at a buffer coordinate, honouring `mask_enabled`.
@@ -153,17 +171,29 @@ struct Step {
     merge: Option<u64>,
 }
 
-impl Step {
-    fn bytes(&self) -> usize {
-        match &self.change {
-            Change::Patch { before, after, .. } => before.len() + after.len(),
-            Change::State { .. } => 0,
+const MAX_STEPS: usize = 200;
+const DEFAULT_HISTORY_BYTES: usize = 1 << 30;
+
+/// Count each shared raster only once. Passing the live document first
+/// excludes buffers that would remain allocated even with no undo history.
+fn raster_bytes(state: &DocState, seen: &mut HashSet<usize>) -> usize {
+    let mut bytes = 0;
+    let mut count = |key, len| {
+        if seen.insert(key) {
+            bytes += len;
+        }
+    };
+    for l in &state.layers {
+        count(Arc::as_ptr(&l.pixels) as usize, l.pixels.data.capacity());
+        if let Some(mask) = &l.mask {
+            count(Arc::as_ptr(mask) as usize, mask.data.capacity());
         }
     }
+    if let Some(selection) = &state.selection {
+        count(Arc::as_ptr(selection) as usize, selection.data.capacity());
+    }
+    bytes
 }
-
-const MAX_STEPS: usize = 200;
-const MAX_PATCH_BYTES: usize = 1 << 30;
 
 pub struct Document {
     pub state: DocState,
@@ -175,12 +205,14 @@ pub struct Document {
     pub target: Target,
     pub path: Option<PathBuf>,
     pub modified: bool,
+    history_byte_limit: usize,
+    revision: u64,
 }
 
 impl Document {
     pub fn from_state(state: DocState) -> Self {
         let dirty = state.canvas();
-        Self { state, steps: Vec::new(), pos: 0, dirty, target: Target::Pixels, path: None, modified: false }
+        Self { state, steps: Vec::new(), pos: 0, dirty, target: Target::Pixels, path: None, modified: false, history_byte_limit: DEFAULT_HISTORY_BYTES, revision: next_id() }
     }
 
     /// New document with one layer, optionally filled with `background`.
@@ -203,6 +235,12 @@ impl Document {
 
     pub fn canvas(&self) -> IRect {
         self.state.canvas()
+    }
+
+    /// Changes after every committed edit, undo or redo, including changes
+    /// that only affect metadata or the selection.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// The effective edit target: `Mask` only if the active layer has one.
@@ -237,15 +275,39 @@ impl Document {
     fn push(&mut self, name: &str, change: Change) {
         self.steps.truncate(self.pos);
         self.steps.push(Step { name: name.to_owned(), change, merge: None });
-        let mut bytes: usize = self.steps.iter().map(Step::bytes).sum();
-        let mut drop = self.steps.len().saturating_sub(MAX_STEPS);
-        while bytes > MAX_PATCH_BYTES && drop < self.steps.len() - 1 {
-            bytes -= self.steps[drop].bytes();
-            drop += 1;
-        }
-        self.steps.drain(..drop);
         self.pos = self.steps.len();
+        self.trim_history();
         self.modified = true;
+        self.revision = next_id();
+    }
+
+    /// Raster and patch bytes retained only for undo/redo. Shared allocations
+    /// and buffers already needed by the current document are not double-counted.
+    pub fn history_bytes(&self) -> usize {
+        let mut seen = HashSet::new();
+        raster_bytes(&self.state, &mut seen);
+        self.steps.iter().map(|step| match &step.change {
+            Change::Patch { before, after, .. } => before.capacity() + after.capacity(),
+            Change::State { before, after } => raster_bytes(before, &mut seen) + raster_bytes(after, &mut seen),
+        }).sum()
+    }
+
+    /// Set the retained-raster budget and immediately discard excess history.
+    /// An edit larger than the budget remains applied, but is not undoable.
+    pub fn set_history_byte_limit(&mut self, bytes: usize) {
+        self.history_byte_limit = bytes;
+        self.trim_history();
+    }
+
+    fn trim_history(&mut self) {
+        while !self.steps.is_empty() && (self.steps.len() > MAX_STEPS || self.history_bytes() > self.history_byte_limit) {
+            if self.pos > 0 {
+                self.steps.remove(0);
+                self.pos -= 1;
+            } else {
+                self.steps.pop();
+            }
+        }
     }
 
     /// Record an arbitrary change as one undo step.
@@ -269,12 +331,16 @@ impl Document {
                 if *k == key && n == name {
                     *after = Box::new(self.state.clone());
                     self.modified = true;
+                    self.revision = next_id();
+                    self.trim_history();
                     return;
                 }
             }
         }
         self.push(name, Change::State { before: Box::new(before), after: Box::new(self.state.clone()) });
-        self.steps.last_mut().unwrap().merge = Some(key);
+        if let Some(step) = self.steps.last_mut() {
+            step.merge = Some(key);
+        }
     }
 
     /// Record a change confined to `rect` (buffer coordinates) of one raster of
@@ -327,6 +393,7 @@ impl Document {
             }
         }
         self.modified = true;
+        self.revision = next_id();
     }
 
     pub fn can_undo(&self) -> bool {
@@ -343,6 +410,7 @@ impl Document {
         }
         self.pos -= 1;
         self.apply(self.pos, true);
+        self.trim_history();
         true
     }
 
@@ -352,6 +420,7 @@ impl Document {
         }
         self.apply(self.pos, false);
         self.pos += 1;
+        self.trim_history();
         true
     }
 
@@ -364,10 +433,10 @@ impl Document {
     pub fn jump_to(&mut self, pos: usize) {
         let pos = pos.min(self.steps.len());
         while self.pos > pos {
-            self.undo();
+            if !self.undo() { break; }
         }
         while self.pos < pos {
-            self.redo();
+            if !self.redo() { break; }
         }
     }
 }

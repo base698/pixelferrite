@@ -6,13 +6,137 @@
 
 use std::sync::Arc;
 
-pub use ab_glyph::FontRef;
-use ab_glyph::{Font, OutlineCurve, point};
-use ab_glyph_rasterizer::Rasterizer;
+use ab_glyph_rasterizer::{Point, Rasterizer, point};
+use skrifa::{GlyphId, MetadataProvider, instance::{LocationRef, Size}, outline::{DrawSettings, OutlinePen}, raw::{ReadError, TableProvider, tables::kern::SubtableKind}};
 
 use crate::buf::{Mask, Pixmap};
 use crate::document::{Document, Layer, LayerId};
 use crate::geom::IRect;
+
+/// A borrowed OpenType face parsed by Fontations. The constructors also
+/// accept a face index for installed font collections.
+pub struct FontRef<'a> {
+    inner: skrifa::FontRef<'a>,
+    units_per_em: u16,
+}
+
+impl<'a> FontRef<'a> {
+    pub fn try_from_slice(data: &'a [u8]) -> Result<Self, ReadError> {
+        Self::try_from_slice_and_index(data, 0)
+    }
+
+    pub fn try_from_slice_and_index(data: &'a [u8], index: u32) -> Result<Self, ReadError> {
+        let inner = skrifa::FontRef::from_index(data, index)?;
+        let units_per_em = inner.head()?.units_per_em();
+        if units_per_em == 0 {
+            return Err(ReadError::MalformedData("font has zero units per em"));
+        }
+        inner.maxp()?;
+        inner.cmap()?;
+        Ok(Self { inner, units_per_em })
+    }
+
+    pub fn units_per_em(&self) -> Option<f32> {
+        Some(self.units_per_em as f32)
+    }
+
+    pub fn glyph_id(&self, ch: char) -> GlyphId {
+        self.inner.charmap().map(ch).unwrap_or(GlyphId::new(0))
+    }
+
+    pub fn h_advance_unscaled(&self, id: GlyphId) -> f32 {
+        self.inner.glyph_metrics(Size::unscaled(), LocationRef::default()).advance_width(id).unwrap_or(0.0)
+    }
+
+    /// Preserve the editor's horizontal, non-variable `kern` table behavior.
+    pub fn kern_unscaled(&self, first: GlyphId, second: GlyphId) -> f32 {
+        self.inner.kern().ok().and_then(|kern| {
+            kern.subtables().filter_map(Result::ok)
+                .filter(|s| s.is_horizontal() && !s.is_cross_stream() && !s.is_variable())
+                .find_map(|s| match s.kind().ok()? {
+                    SubtableKind::Format0(s) => s.kerning(first, second),
+                    SubtableKind::Format2(s) => s.kerning(first, second),
+                    SubtableKind::Format3(s) => s.kerning(first, second),
+                    _ => None,
+                })
+        }).unwrap_or(0) as f32
+    }
+
+    fn glyph_bounds(&self, id: GlyphId) -> Option<(Point, Point)> {
+        let bounds = self.inner.glyph_metrics(Size::unscaled(), LocationRef::default()).bounds(id)?;
+        if bounds.x_min >= bounds.x_max || bounds.y_min >= bounds.y_max {
+            return None;
+        }
+        Some((point(bounds.x_min, bounds.y_min), point(bounds.x_max, bounds.y_max)))
+    }
+
+    fn outline(&self, id: GlyphId) -> Option<Outline> {
+        let glyphs = self.inner.outline_glyphs();
+        let glyph = glyphs.get(id)?;
+        let mut pen = CurvePen::default();
+        glyph.draw(DrawSettings::unhinted(Size::unscaled(), LocationRef::default()), &mut pen).ok()?;
+        (!pen.curves.is_empty() && !pen.too_complex).then_some(Outline {
+            curves: pen.curves,
+        })
+    }
+}
+
+enum OutlineCurve {
+    Line(Point, Point),
+    Quad(Point, Point, Point),
+    Cubic(Point, Point, Point, Point),
+}
+
+struct Outline {
+    curves: Vec<OutlineCurve>,
+}
+
+#[derive(Default)]
+struct CurvePen {
+    first: Option<Point>,
+    current: Option<Point>,
+    curves: Vec<OutlineCurve>,
+    too_complex: bool,
+}
+
+impl CurvePen {
+    fn push(&mut self, curve: OutlineCurve) {
+        if self.curves.len() < 100_000 {
+            self.curves.push(curve);
+        } else {
+            self.too_complex = true;
+        }
+    }
+}
+
+impl OutlinePen for CurvePen {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let p = point(x, y);
+        self.first = Some(p);
+        self.current = Some(p);
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        let p = point(x, y);
+        if let Some(a) = self.current { self.push(OutlineCurve::Line(a, p)); }
+        self.current = Some(p);
+    }
+    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+        let p = point(x, y);
+        if let Some(a) = self.current { self.push(OutlineCurve::Quad(a, point(cx, cy), p)); }
+        self.current = Some(p);
+    }
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        let p = point(x, y);
+        if let Some(a) = self.current { self.push(OutlineCurve::Cubic(a, point(cx0, cy0), point(cx1, cy1), p)); }
+        self.current = Some(p);
+    }
+    fn close(&mut self) {
+        if let (Some(a), Some(b)) = (self.current, self.first) {
+            if a != b { self.push(OutlineCurve::Line(a, b)); }
+        }
+        self.current = self.first;
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
@@ -85,7 +209,7 @@ impl Default for TextSpec {
 
 /// A glyph placed on the page: scale, then rotate by `angle`, then move to `pos`.
 struct Placed {
-    id: ab_glyph::GlyphId,
+    id: GlyphId,
     pos: (f32, f32),
     angle: f32,
 }
@@ -170,40 +294,62 @@ fn layout(spec: &TextSpec, font: &FontRef<'_>) -> Vec<Placed> {
     placed
 }
 
-/// Render `spec` to pixels. Returns them with their position relative to the
-/// text origin; empty text gives a 1x1 transparent pixmap at the origin.
-pub fn render(spec: &TextSpec, font: &FontRef<'_>) -> (Pixmap, (i32, i32)) {
+fn transform_point(g: &Placed, scale: f32, p: Point) -> (f32, f32) {
+    let (sin, cos) = g.angle.sin_cos();
+    // Font units are y-up; the page is y-down.
+    let (x, y) = (p.x * scale, -p.y * scale);
+    (g.pos.0 + x * cos - y * sin, g.pos.1 + x * sin + y * cos)
+}
+
+fn bounded_layout(spec: &TextSpec, font: &FontRef<'_>) -> Option<(Vec<(Placed, IRect)>, IRect)> {
+    crate::io::limits::validate_text(spec).ok()?;
     let scale = spec.size / font.units_per_em().unwrap_or(1000.0);
-    let glyphs: Vec<_> = layout(spec, font)
-        .into_iter()
-        .filter_map(|g| {
-            let o = font.outline(g.id)?;
-            let (sin, cos) = g.angle.sin_cos();
-            // Font units are y-up; the page is y-down.
-            let tf = move |p: ab_glyph::Point| {
-                let (x, y) = (p.x * scale, -p.y * scale);
-                (g.pos.0 + x * cos - y * sin, g.pos.1 + x * sin + y * cos)
-            };
-            let b = o.bounds;
-            let corners = [point(b.min.x, b.min.y), point(b.max.x, b.min.y), point(b.max.x, b.max.y), point(b.min.x, b.max.y)].map(tf);
-            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-            for (x, y) in corners {
-                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
-            }
-            (x0.is_finite() && x1.is_finite() && y0.is_finite() && y1.is_finite())
-                .then(|| (o, tf, IRect::enclosing(x0 - 1.0, y0 - 1.0, x1 + 1.0, y1 + 1.0)))
-        })
-        .collect();
-    let bounds = glyphs.iter().fold(IRect::EMPTY, |r, g| r.union(g.2));
-    // Refuse absurd sizes rather than exhausting memory.
-    if bounds.is_empty() || bounds.width() as i64 * bounds.height() as i64 > 1 << 28 {
+    let mut glyphs = Vec::new();
+    let mut bounds = IRect::EMPTY;
+    for g in layout(spec, font) {
+        let Some((min, max)) = font.glyph_bounds(g.id) else { continue };
+        let corners = [min, point(max.x, min.y), max, point(min.x, max.y)].map(|p| transform_point(&g, scale, p));
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (x, y) in corners {
+            if !x.is_finite() || !y.is_finite() { return None; }
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+        let r = IRect::enclosing(x0 - 1.0, y0 - 1.0, x1 + 1.0, y1 + 1.0);
+        bounds = bounds.union(r);
+        let (w, h) = (bounds.x1 as i64 - bounds.x0 as i64, bounds.y1 as i64 - bounds.y0 as i64);
+        if w <= 0 || h <= 0 || w > u32::MAX as i64 || h > u32::MAX as i64 { return None; }
+        crate::io::limits::validate_dimensions(w as u32, h as u32).ok()?;
+        crate::io::limits::validate_offset(bounds.x0, bounds.y0).ok()?;
+        glyphs.push((g, r));
+    }
+    if bounds.is_empty() { bounds = IRect::xywh(0, 0, 1, 1); }
+    Some((glyphs, bounds))
+}
+
+/// Validate and measure the raster frame without allocating pixel buffers.
+/// Empty text occupies one transparent pixel; unsupported sizes return None.
+pub fn render_bounds(spec: &TextSpec, font: &FontRef<'_>) -> Option<IRect> {
+    bounded_layout(spec, font).map(|(_, bounds)| bounds)
+}
+
+/// Render `spec` to pixels. Returns them with their position relative to the
+/// text origin; empty or unsupported text gives a 1x1 transparent pixmap.
+pub fn render(spec: &TextSpec, font: &FontRef<'_>) -> (Pixmap, (i32, i32)) {
+    let Some((glyphs, bounds)) = bounded_layout(spec, font) else {
+        return (Pixmap::new(1, 1), (0, 0));
+    };
+    if glyphs.is_empty() {
         return (Pixmap::new(1, 1), (0, 0));
     }
+    let scale = spec.size / font.units_per_em().unwrap_or(1000.0);
     let mut cov = Mask::new(bounds.width() as u32, bounds.height() as u32);
-    for (outline, tf, r) in &glyphs {
+    // Keep only one glyph's outlines alive at once, after validating the
+    // complete text frame and before allocating that glyph's rasterizer.
+    for (g, r) in &glyphs {
+        let Some(outline) = font.outline(g.id) else { continue };
         let mut ras = Rasterizer::new(r.width() as usize, r.height() as usize);
-        let local = |p: ab_glyph::Point| {
-            let (x, y) = tf(p);
+        let local = |p: Point| {
+            let (x, y) = transform_point(g, scale, p);
             point(x - r.x0 as f32, y - r.y0 as f32)
         };
         for c in &outline.curves {
@@ -282,7 +428,24 @@ impl Layer {
 }
 
 impl Document {
+    /// Validate layout, document capacity and placement before allocating a
+    /// text raster. Use this for text entered through the editor.
+    pub fn try_add_text_layer(&mut self, mut spec: TextSpec, origin: (i32, i32), font: &FontRef<'_>) -> crate::io::Result<LayerId> {
+        let bounds = render_bounds(&spec, font).ok_or_else(|| crate::io::Error::Format("text exceeds the supported layout limits".into()))?;
+        self.check_layer_capacity(bounds.width() as u32, bounds.height() as u32)?;
+        let x = origin.0.checked_add(bounds.x0).ok_or_else(|| crate::io::Error::Format("text position overflow".into()))?;
+        let y = origin.1.checked_add(bounds.y0).ok_or_else(|| crate::io::Error::Format("text position overflow".into()))?;
+        crate::io::limits::validate_offset(x, y)?;
+        let (px, off) = render(&spec, font);
+        spec.raster = off;
+        let mut layer = Layer::new("Text", px, x, y);
+        layer.text = Some(Arc::new(spec));
+        self.try_insert_layer("Add Text", layer)
+    }
+
     /// Add a text layer with its origin at `origin` (document space).
+    /// The caller must have validated the text layout and document capacity;
+    /// user-entered text should use [`Self::try_add_text_layer`].
     pub fn add_text_layer(&mut self, mut spec: TextSpec, origin: (i32, i32), font: &FontRef<'_>) -> LayerId {
         let (px, off) = render(&spec, font);
         spec.raster = off;
@@ -294,12 +457,22 @@ impl Document {
     /// Re-render a text layer from `spec`, keeping its origin. Not an undo
     /// step by itself: wrap it in `begin` / `commit`.
     pub fn update_text(&mut self, id: LayerId, mut spec: TextSpec, font: &FontRef<'_>) -> bool {
-        let Some(layer) = self.state.layer_mut(id) else { return false };
+        let Some(bounds) = render_bounds(&spec, font) else { return false };
+        let Some(layer) = self.state.layer(id) else { return false };
+        if layer.locked {
+            return false;
+        }
         let Some(origin) = layer.text_origin() else { return false };
         let old = layer.rect();
+        let (Some(x), Some(y)) = (origin.0.checked_add(bounds.x0), origin.1.checked_add(bounds.y0)) else { return false };
+        if crate::io::limits::validate_offset(x, y).is_err()
+            || self.check_layer_resize(id, bounds.width() as u32, bounds.height() as u32).is_err() {
+            return false;
+        }
         let (px, off) = render(&spec, font);
         spec.raster = off;
-        let new = IRect::xywh(origin.0 + off.0, origin.1 + off.1, px.w, px.h);
+        let new = IRect::xywh(x, y, px.w, px.h);
+        let layer = self.state.layer_mut(id).unwrap();
         if let Some(m) = &layer.mask {
             layer.mask = Some(Arc::new(m.reframed(new.translate(-old.x0, -old.y0), [255])));
         }

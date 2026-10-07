@@ -13,6 +13,16 @@ use pf_core::{Document, Pixmap, Target, io};
 use crate::app::{Action, App};
 use crate::tools::{GradientFill, Tool};
 
+fn wait_image_work(h: &mut Harness<'_, App>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while h.state().work.is_some() {
+        assert!(std::time::Instant::now() < deadline, "background image operation timed out");
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    h.run_steps(2);
+}
+
 fn button(h: &Harness<'_, App>, pos: Pos2, pressed: bool) {
     h.event(Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
 }
@@ -33,7 +43,7 @@ fn drag(h: &mut Harness<'_, App>, pts: &[Pos2]) {
 
 #[test]
 fn paint_select_and_render() {
-    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/uitest");
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/uitest/paint_select_and_render-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
     let image = match std::env::var_os("PF_TEST_IMAGE") {
         Some(p) => PathBuf::from(p),
@@ -137,7 +147,7 @@ fn paint_select_and_render() {
 
 #[test]
 fn text_on_path_and_blur() {
-    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/uitest");
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/uitest/text_on_path_and_blur-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
     let mut h = Harness::builder().with_size(vec2(1400.0, 880.0)).wgpu().build_eframe(|cc| App::new(cc, None));
     h.run_steps(3);
@@ -202,7 +212,7 @@ fn text_on_path_and_blur() {
     // Gaussian blur previews live, and Cancel puts everything back.
     let sharp = h.state().doc.state.active_layer().unwrap().pixels.clone();
     h.state_mut().run(&ctx, Action::GaussianBlur);
-    h.run_steps(2);
+    wait_image_work(&mut h);
     assert!(h.state().filter.is_some());
     assert_ne!(h.state().doc.state.active_layer().unwrap().pixels.data, sharp.data, "preview should already be blurred");
     h.render().unwrap().save(out.join("blur.png")).unwrap();
@@ -217,7 +227,7 @@ fn text_on_path_and_blur() {
 
     // Apply makes it one undo step and turns the text into pixels.
     h.state_mut().run(&ctx, Action::GaussianBlur);
-    h.run_steps(2);
+    wait_image_work(&mut h);
     key(&mut h, egui::Key::Enter);
     assert!(h.state().filter.is_none());
     let (names, _) = h.state().doc.history();
@@ -230,7 +240,7 @@ fn text_on_path_and_blur() {
 #[test]
 fn edge_detection_and_ai_edit() {
     use std::io::{Read, Write};
-    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/uitest");
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/uitest/edge_detection_and_ai_edit-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
     let mut h = Harness::builder().with_size(vec2(1400.0, 880.0)).wgpu().build_eframe(|cc| App::new(cc, None));
     h.run_steps(3);
@@ -256,7 +266,7 @@ fn edge_detection_and_ai_edit() {
 
     // Edge detection previews, and can become a selection instead.
     h.state_mut().run(&ctx, Action::EdgeDetect);
-    h.run_steps(2);
+    wait_image_work(&mut h);
     let px = h.state().doc.state.layers[0].pixels.clone();
     let dark = px.data.chunks_exact(4).filter(|p| p[0] < 128).count();
     assert!(dark > 500 && dark < px.data.len() / 4 / 20, "lines on white expected, {dark} dark pixels");
@@ -373,9 +383,11 @@ fn edge_detection_and_ai_edit() {
     // Opened files show up under Open Recent, newest first.
     assert!(store.recent().is_empty());
     h.state_mut().open_path(&photo);
-    h.state_mut().open_path(&out.join("input.png"));
+    let recent_input = out.join("recent-input.png");
+    io::export(&Document::new(8, 8, Some([255; 4])).state, &recent_input).unwrap();
+    h.state_mut().open_path(&recent_input);
     let recent = store.recent();
-    assert_eq!(recent.iter().map(|f| f.path.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["input.png", "insert.png"]);
+    assert_eq!(recent.iter().map(|f| f.path.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["recent-input.png", "insert.png"]);
     h.state_mut().open_path(&out.join("does-not-exist.png"));
     assert_eq!(store.recent().len(), 2);
 }
@@ -383,7 +395,7 @@ fn edge_detection_and_ai_edit() {
 #[test]
 fn smart_select_filters_and_geometry() {
     use pf_core::filter::Filter;
-    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/uitest");
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/uitest/smart_select_filters_and_geometry-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
     // A photo-like scene: textured backdrop with a distinct red disc.
     let mut px = Pixmap::new(800, 600);
@@ -416,7 +428,7 @@ fn smart_select_filters_and_geometry() {
 
     // Heal Selection needs that selection, and removes the disc.
     h.state_mut().run(&ctx, Action::OpenFilter(Filter::Inpaint { radius: 8.0 }));
-    h.run_steps(2);
+    wait_image_work(&mut h);
     assert!(h.state().filter.is_some());
     key(&mut h, egui::Key::Enter);
     let healed = pf_core::composite::sample(&h.state().doc.state, 300, 300).unwrap();
@@ -451,7 +463,7 @@ fn smart_select_filters_and_geometry() {
     // A tone filter through its dialog.
     h.state_mut().tool = Tool::Move;
     h.state_mut().run(&ctx, Action::OpenFilter(Filter::LocalContrast { clip: 3.0, tiles: 8 }));
-    h.run_steps(2);
+    wait_image_work(&mut h);
     h.render().unwrap().save(out.join("local-contrast.png")).unwrap();
     key(&mut h, egui::Key::Enter);
     assert_eq!(h.state().doc.history().0.last(), Some("Local Contrast"));
@@ -462,6 +474,7 @@ fn smart_select_filters_and_geometry() {
     assert!(h.state().warp.is_some());
     let (from, to) = (at(&h, 800.0, 0.0), at(&h, 700.0, 120.0));
     drag(&mut h, &[from, from + (to - from) * 0.5, to]);
+    wait_image_work(&mut h);
     assert_eq!(pf_core::composite::sample(&h.state().doc.state, 780, 20).unwrap()[3], 0, "the pulled-in corner leaves the canvas showing");
     h.run_steps(2);
     h.render().unwrap().save(out.join("perspective.png")).unwrap();

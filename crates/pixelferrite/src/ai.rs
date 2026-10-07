@@ -30,27 +30,28 @@ pub struct Reply {
     pub usage: Option<serde_json::Value>,
 }
 
-/// Where a `.env` may live: the working directory and its parents, next to
-/// the executable (and its parents, which covers `target/release`), and the
-/// user's config directory.
+/// A local .env is only a fallback source of an OpenAI key. Its URL is never
+/// trusted, and unrelated ancestors/executable directories are not searched.
 pub fn env_files() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut walk = |start: Option<PathBuf>, depth: usize| {
-        let mut dir = start;
-        for _ in 0..depth {
-            let Some(d) = dir else { break };
-            out.push(d.join(".env"));
-            dir = d.parent().map(PathBuf::from);
-        }
-    };
-    walk(std::env::current_dir().ok(), 6);
-    // Deep enough to reach the repository from dist/Pixelferrite.app/Contents/MacOS.
-    walk(std::env::current_exe().ok().and_then(|p| p.canonicalize().ok()).and_then(|p| p.parent().map(PathBuf::from)), 6);
-    if let Some(home) = std::env::var_os("HOME") {
-        out.push(PathBuf::from(home).join(".config/pixelferrite/.env"));
+    std::env::current_dir().ok().map(|p| vec![p.join(".env")]).unwrap_or_default()
+}
+
+/// Validate the exact upload origin before any bytes or credentials are sent.
+pub fn endpoint_origin(base: &str) -> Result<String, String> {
+    if base.contains(['#', '@']) || base.trim() != base {
+        return Err("The API URL must not contain credentials, fragments or whitespace.".into());
     }
-    out.dedup();
-    out
+    let uri: ureq::http::Uri = base.parse().map_err(|_| "The API URL is invalid.")?;
+    if uri.query().is_some() { return Err("The API URL must not contain a query.".into()); }
+    let scheme = uri.scheme_str().ok_or("The API URL must start with https://.")?;
+    let host = uri.host().ok_or("The API URL needs a host.")?.to_ascii_lowercase();
+    let loopback = host == "localhost" || host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if scheme != "https" && !(scheme == "http" && loopback) {
+        return Err("Use HTTPS for the API URL. HTTP is allowed only for local development on loopback.".into());
+    }
+    let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let default_port = (scheme == "https" && port == 443) || (scheme == "http" && port == 80);
+    Ok(if default_port { format!("{scheme}://{host}") } else { format!("{scheme}://{host}:{port}") })
 }
 
 fn parse_env(text: &str) -> HashMap<String, String> {
@@ -72,30 +73,47 @@ fn parse_env(text: &str) -> HashMap<String, String> {
 }
 
 impl Config {
-    /// Each setting comes from the nearest `.env` that has it, then the
-    /// app's settings file, then the shell environment. Files win so that a
-    /// stale key exported by a shell profile can't shadow one written for
-    /// this app. Read fresh each time so changes apply without a restart.
+    /// Credentials and destination come from one trusted configuration source.
+    /// Saved settings win over the process environment. A local .env is a
+    /// fallback for OpenAI only and cannot redirect a saved or exported key.
     pub fn load(saved: &AiSettings) -> Self {
-        let files: Vec<(PathBuf, HashMap<String, String>)> =
-            env_files().into_iter().filter_map(|p| Some((p.clone(), parse_env(&std::fs::read_to_string(&p).ok()?)))).collect();
-        let get = |k: &str, saved: &str| -> Option<(String, String)> {
-            let set = |v: &String| !v.trim().is_empty();
-            files
-                .iter()
-                .find_map(|(p, f)| Some((f.get(k).cloned().filter(set)?, p.display().to_string())))
-                .or_else(|| Some(saved.to_owned()).filter(set).map(|v| (v, "Pixelferrite settings".to_owned())))
-                .or_else(|| std::env::var(k).ok().filter(set).map(|v| (v, format!("the {k} environment variable"))))
+        let local = env_files().into_iter().find_map(|p| {
+            Some((p.clone(), parse_env(&std::fs::read_to_string(&p).ok()?)))
+        });
+        let environment = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_IMAGE_MODEL", "OPENAI_IMAGE_QUALITY"]
+            .into_iter().filter_map(|k| Some((k.to_owned(), std::env::var(k).ok()?))).collect();
+        Self::resolve(saved, &environment, local.as_ref().map(|(p, f)| (p.display().to_string(), f)))
+    }
+
+    fn resolve(saved: &AiSettings, environment: &HashMap<String, String>, local: Option<(String, &HashMap<String, String>)>) -> Self {
+        let present = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_owned());
+        let value = |map: &HashMap<String, String>, k: &str| map.get(k).and_then(|s| present(s));
+        let mut cfg = Self {
+            key: None, model: present(&saved.model).unwrap_or_else(|| DEFAULT_MODEL.into()),
+            base: DEFAULT_BASE.into(), quality: present(&saved.quality).filter(|q| q != "auto"), key_source: String::new(),
         };
-        let value = |k: &str, saved: &str| get(k, saved).map(|v| v.0);
-        let key = get("OPENAI_API_KEY", &saved.api_key);
-        Self {
-            key_source: key.as_ref().map(|k| k.1.clone()).unwrap_or_default(),
-            key: key.map(|k| k.0.trim().to_owned()),
-            model: value("OPENAI_IMAGE_MODEL", &saved.model).unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
-            base: value("OPENAI_BASE_URL", &saved.base_url).unwrap_or_else(|| DEFAULT_BASE.to_owned()).trim_end_matches('/').to_owned(),
-            quality: value("OPENAI_IMAGE_QUALITY", &saved.quality).filter(|q| q != "auto"),
+        if let Some(key) = present(&saved.api_key) {
+            cfg.base = present(&saved.base_url).unwrap_or_else(|| DEFAULT_BASE.into()).trim_end_matches('/').into();
+            let bound = present(&saved.api_key_origin).unwrap_or_else(|| "https://api.openai.com".into());
+            if endpoint_origin(&cfg.base).ok().as_deref() == Some(bound.as_str()) {
+                cfg.key = Some(key);
+                cfg.key_source = "Pixelferrite settings".into();
+            } else {
+                cfg.key_source = "The endpoint changed. Re-enter its key in Settings to authorize this destination.".into();
+            }
+        } else if let Some(key) = value(environment, "OPENAI_API_KEY") {
+            cfg.key = Some(key);
+            cfg.key_source = "the OPENAI_API_KEY environment variable".into();
+            cfg.base = value(environment, "OPENAI_BASE_URL").unwrap_or_else(|| DEFAULT_BASE.into()).trim_end_matches('/').into();
+            cfg.model = value(environment, "OPENAI_IMAGE_MODEL").unwrap_or(cfg.model);
+            cfg.quality = value(environment, "OPENAI_IMAGE_QUALITY").or(cfg.quality).filter(|q| q != "auto");
+        } else if let Some((path, map)) = local {
+            cfg.key = value(map, "OPENAI_API_KEY");
+            cfg.key_source = path;
+            cfg.model = value(map, "OPENAI_IMAGE_MODEL").unwrap_or(cfg.model);
+            cfg.quality = value(map, "OPENAI_IMAGE_QUALITY").or(cfg.quality).filter(|q| q != "auto");
         }
+        cfg
     }
 }
 
@@ -160,6 +178,7 @@ fn multipart(parts: &[(&str, Option<&str>, &[u8])]) -> (String, Vec<u8>) {
 /// (`size` pixels) and `mask_png`, if given, is transparent where it should
 /// edit. Blocks until the answer arrives.
 pub fn edit(cfg: &Config, prompt: &str, size: (u32, u32), png: &[u8], mask_png: Option<&[u8]>) -> Result<Reply, String> {
+    endpoint_origin(&cfg.base)?;
     let key = cfg.key.as_deref().ok_or("No OpenAI API key found. Add one in File > Settings, or put OPENAI_API_KEY=... in a .env file.")?;
     let size = format!("{}x{}", size.0, size.1);
     let mut parts: Vec<(&str, Option<&str>, &[u8])> = vec![
@@ -179,6 +198,7 @@ pub fn edit(cfg: &Config, prompt: &str, size: (u32, u32), png: &[u8], mask_png: 
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(600)))
         .http_status_as_error(false)
+        .max_redirects(0)
         .build()
         .into();
     let mut resp = agent
@@ -186,15 +206,18 @@ pub fn edit(cfg: &Config, prompt: &str, size: (u32, u32), png: &[u8], mask_png: 
         .header("Authorization", format!("Bearer {key}"))
         .header("Content-Type", content_type)
         .send(&body[..])
-        .map_err(|e| format!("Couldn't reach OpenAI: {e}"))?;
+        .map_err(|e| format!("Couldn't reach the image service: {e}"))?;
     let status = resp.status().as_u16();
-    let text = resp.body_mut().with_config().limit(512 << 20).read_to_string().map_err(|e| format!("Couldn't read the reply: {e}"))?;
+    let text = resp.body_mut().with_config().limit(64 << 20).read_to_string().map_err(|e| format!("Couldn't read the reply: {e}"))?;
     let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    if (300..400).contains(&status) {
+        return Err("The image service returned a redirect. Redirects are blocked to protect your key and image.".into());
+    }
     if !(200..300).contains(&status) {
         let msg = json["error"]["message"].as_str().map(str::to_owned).unwrap_or_else(|| text.chars().take(300).collect());
-        return Err(format!("OpenAI returned an error ({status}): {msg}"));
+        return Err(format!("The image service returned an error ({status}): {msg}"));
     }
-    let b64 = json["data"][0]["b64_json"].as_str().ok_or("OpenAI's reply didn't contain an image.")?;
+    let b64 = json["data"][0]["b64_json"].as_str().ok_or("The image service's reply didn't contain an image.")?;
     let file = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| format!("Couldn't decode the image: {e}"))?;
     let pixels = io::decode_image(&file).map_err(|e| format!("Couldn't decode the image: {e}"))?;
     Ok(Reply { pixels, file, usage: json.get("usage").filter(|u| !u.is_null()).cloned() })
@@ -212,6 +235,67 @@ fn edit_pixels(cfg: &Config, prompt: &str, image: &Pixmap, mask: Option<&Pixmap>
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn credentials_stay_with_their_approved_origin() {
+        let hostile = parse_env("OPENAI_BASE_URL=https://collector.invalid/v1\nOPENAI_API_KEY=untrusted-local-key");
+        let env = parse_env("OPENAI_API_KEY=exported-key\nOPENAI_BASE_URL=https://configured.example/v1");
+        let mut saved = AiSettings { api_key: "saved-key".into(), ..Default::default() };
+        let cfg = Config::resolve(&saved, &env, Some(("untrusted/.env".into(), &hostile)));
+        assert_eq!(cfg.key.as_deref(), Some("saved-key"));
+        assert_eq!(cfg.base, DEFAULT_BASE);
+        saved.base_url = "https://changed.example/v1".into();
+        assert!(Config::resolve(&saved, &env, None).key.is_none(), "a destination edit must not reuse the old secret");
+        saved.api_key_origin = endpoint_origin(&saved.base_url).unwrap();
+        assert_eq!(Config::resolve(&saved, &env, None).key.as_deref(), Some("saved-key"));
+        let cfg = Config::resolve(&AiSettings::default(), &env, Some(("untrusted/.env".into(), &hostile)));
+        assert_eq!(cfg.key.as_deref(), Some("exported-key"));
+        assert_eq!(cfg.base, "https://configured.example/v1");
+        let cfg = Config::resolve(&AiSettings::default(), &HashMap::new(), Some(("untrusted/.env".into(), &hostile)));
+        assert_eq!(cfg.base, DEFAULT_BASE, "dotenv cannot choose an upload destination");
+        assert!(env_files().len() <= 1, "do not discover keys in unrelated ancestors");
+    }
+
+    #[test]
+    fn endpoint_validation_requires_tls_outside_loopback() {
+        for base in ["https://api.openai.com/v1", "https://example.test:8443/v1", "http://127.0.0.1:1234", "http://[::1]:1234", "http://localhost:1234"] {
+            assert!(endpoint_origin(base).is_ok(), "{base}");
+        }
+        for base in ["http://example.com/v1", "http://localhost.evil.test", "https://user:secret@example.com/v1", "https://example.com/v1?secret=x", "https://example.com/v1#fragment", "file:///tmp/image", "example.com/v1"] {
+            assert!(endpoint_origin(base).is_err(), "{base}");
+        }
+        assert_eq!(endpoint_origin("https://API.OPENAI.COM:443/v1").unwrap(), "https://api.openai.com");
+    }
+
+    #[test]
+    fn redirects_cannot_forward_uploaded_images() {
+        let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let location = format!("http://{}/stolen", destination.local_addr().unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = Config { key: Some("fixture-key".into()), model: "fixture".into(), base: format!("http://{}", listener.local_addr().unwrap()), quality: None, key_source: "test".into() };
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len: usize = text.split("content-length:").nth(1).unwrap().lines().next().unwrap().trim().parse().unwrap();
+                    if request.len() >= end + 4 + len { break; }
+                }
+            }
+            write!(stream, "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let error = edit_pixels(&cfg, "fixture", &Pixmap::filled(2, 2, [255; 4]), None).err().unwrap();
+        server.join().unwrap();
+        assert!(error.contains("Redirects are blocked"), "{error}");
+        assert!(destination.accept().is_err(), "no connection may be made to a redirect destination");
+    }
 
     #[test]
     fn env_parsing() {

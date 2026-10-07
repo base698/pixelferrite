@@ -139,7 +139,7 @@ fn layer_ops_and_clipboard() {
     doc.reorder_layer(pasted, ops::Reorder::Back);
     assert_eq!(doc.state.layers[0].id, pasted);
     doc.reorder_layer(pasted, ops::Reorder::Front);
-    doc.merge_down(pasted);
+    doc.merge_down(pasted).unwrap();
     assert_eq!(doc.state.layers.len(), 2);
     assert_eq!(doc.state.active, top);
     assert_eq!(px(&doc, 12, 12), RED);
@@ -176,8 +176,8 @@ fn ora_roundtrip_and_export() {
     for e in io::EXPORT_EXTENSIONS {
         let p = dir.join(format!("out.{e}"));
         io::export(&doc.state, &p).unwrap();
-        let img = io::load_pixmap(&p).unwrap();
-        assert_eq!((img.w, img.h), (48, 32));
+        let imported = io::open(&p).unwrap();
+        assert_eq!((imported.state.width, imported.state.height), (48, 32));
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -222,7 +222,7 @@ fn gaussian_blur_filter() {
 
 #[test]
 fn text_layers() {
-    use ab_glyph::FontRef;
+    use pf_core::text::FontRef;
     use pf_core::text::{self, TextSpec};
     let font = FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).unwrap();
     let ink = |doc: &Document, r: IRect| {
@@ -573,7 +573,7 @@ fn ai_edit_fills_empty_canvas() {
     use pf_core::aiedit::{Source, prepare};
     // A red block in the middle of an otherwise empty canvas.
     let mut doc = Document::new(300, 100, None);
-    doc.add_image_scaled("block", &Pixmap::filled(10, 10, [200, 30, 30, 255]), IRect::new(100, 0, 200, 100));
+    doc.add_image_scaled("block", &Pixmap::filled(10, 10, [200, 30, 30, 255]), IRect::new(100, 0, 200, 100)).unwrap();
     let job = prepare(&doc.state, Source::Visible, |w, h| (w, h)).unwrap();
     assert!(job.image.data.chunks_exact(4).all(|p| p[3] == 255), "nothing see-through is sent");
     assert_eq!(job.image.px(150, 50), [200, 30, 30, 255], "what was there is untouched");

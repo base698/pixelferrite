@@ -3,15 +3,17 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-cargo build --release -p pixelferrite
+cargo build --release --locked -p pixelferrite
 
 app=dist/Pixelferrite.app
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/pixelferrite/Cargo.toml | head -1)
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/pixelferrite "$app/Contents/MacOS/pixelferrite"
+cp "${CARGO_TARGET_DIR:-target}/release/pixelferrite" "$app/Contents/MacOS/pixelferrite"
 
-set=$(mktemp -d)/Pixelferrite.iconset
+icon_tmp=$(mktemp -d)
+trap 'rm -rf "$icon_tmp"' EXIT HUP INT TERM
+set="$icon_tmp/Pixelferrite.iconset"
 mkdir "$set"
 for s in 16 32 128 256 512; do
     sips -z $s $s assets/icon.png --out "$set/icon_${s}x${s}.png" >/dev/null

@@ -89,6 +89,7 @@ pub enum PerspectiveMode {
 
 /// Interactive perspective change of one layer: `update` as corners move
 /// (it re-renders from the snapshot), then `finish` or `cancel`.
+#[derive(Clone)]
 pub struct PerspectiveOp {
     before: DocState,
     pub layer: LayerId,
@@ -133,7 +134,12 @@ impl PerspectiveOp {
                 IRect::enclosing(x0 as f32, y0 as f32, x1 as f32, y1 as f32)
             }
         };
-        if out.is_empty() || out.width() as i64 * out.height() as i64 > 1 << 27 {
+        let (ow, oh) = (out.x1 as i64 - out.x0 as i64, out.y1 as i64 - out.y0 as i64);
+        if out.is_empty() || ow > u32::MAX as i64 || oh > u32::MAX as i64
+            || crate::io::limits::validate_dimensions(ow as u32, oh as u32).is_err()
+            || doc.check_layer_resize(self.layer, ow as u32, oh as u32).is_err()
+            || out.x0.unsigned_abs() > crate::io::limits::MAX_LAYER_OFFSET as u32
+            || out.y0.unsigned_abs() > crate::io::limits::MAX_LAYER_OFFSET as u32 {
             return false;
         }
         let (lx, ly) = (orig.x as f64, orig.y as f64);
@@ -168,7 +174,7 @@ impl PerspectiveOp {
 fn carve_columns<const C: usize>(data: &mut Vec<u8>, w: &mut usize, h: usize, n: usize, also: &mut Option<Vec<u8>>) {
     for _ in 0..n {
         let cw = *w;
-        if cw <= 2 {
+        if cw <= 1 {
             break;
         }
         let lum = |x: usize, y: usize| {
