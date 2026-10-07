@@ -23,8 +23,11 @@ fn about_menu_shows_and_copies_build_identity_without_editing_document() {
     h.get_by_label("About Pixelferrite").click();
     h.run_steps(2);
     assert!(h.state().show_about);
-    h.get_by_label(crate::about::COMMIT);
-    h.get_by_label(crate::about::SOURCE_STATUS);
+    // Source archives legitimately display "Unknown" in both value cells.
+    for value in [crate::about::COMMIT, crate::about::SOURCE_STATUS] {
+        let expected = if crate::about::COMMIT == crate::about::SOURCE_STATUS { 2 } else { 1 };
+        assert_eq!(h.query_all_by_label(value).count(), expected);
+    }
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/uitest/about-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
     h.render().unwrap().save(out.join("about.png")).unwrap();
