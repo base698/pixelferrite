@@ -187,6 +187,27 @@ fn history_budget_counts_masks_selections_and_merged_state_edits() {
 }
 
 #[test]
+fn history_jump_does_not_redo_when_budget_eviction_shifts_indices() {
+    let mut d = Document::new(4, 4, Some(WHITE));
+    d.set_history_byte_limit(1024);
+    for value in [1, 2] {
+        let before = d.begin();
+        Arc::make_mut(&mut d.state.active_layer_mut().unwrap().pixels).data[0] = value;
+        d.commit("Paint", before);
+    }
+    let before = d.begin();
+    d.state.active_layer_mut().unwrap().pixels = Arc::new(Pixmap::filled(16, 16, RED));
+    d.commit("Resize", before);
+    assert_eq!(d.history().1, 3);
+    d.jump_to(2);
+    assert_eq!(d.state.active_layer().unwrap().pixels.w, 4);
+    assert_eq!(d.state.active_layer().unwrap().pixels.data[0], 2);
+    assert!(d.history_bytes() <= 1024);
+    assert!(d.redo());
+    assert_eq!(d.state.active_layer().unwrap().pixels.w, 16);
+}
+
+#[test]
 fn locked_layers_reject_content_and_structural_edits() {
     let mut d = Document::new(3, 1, None);
     Arc::make_mut(&mut d.state.active_layer_mut().unwrap().pixels).set(0, 0, RED);

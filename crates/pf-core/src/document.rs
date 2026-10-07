@@ -432,11 +432,18 @@ impl Document {
     /// Undo/redo until exactly `pos` steps are applied.
     pub fn jump_to(&mut self, pos: usize) {
         let pos = pos.min(self.steps.len());
-        while self.pos > pos {
-            if !self.undo() { break; }
-        }
-        while self.pos < pos {
-            if !self.redo() { break; }
+        let applied = self.pos;
+        // Eviction during navigation can shift the retained history indices.
+        // Follow the requested number of steps without accidentally reversing
+        // direction when the baseline advances.
+        if pos < applied {
+            for _ in pos..applied {
+                if !self.undo() { break; }
+            }
+        } else {
+            for _ in applied..pos {
+                if !self.redo() { break; }
+            }
         }
     }
 }
