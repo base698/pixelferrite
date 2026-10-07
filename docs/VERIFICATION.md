@@ -18,40 +18,16 @@ The second command deliberately runs the formerly dependent UI test alone. UI te
 
 The two-platform `Checks` workflow runs tests on macOS and Linux and builds a macOS app bundle. `Dependency advisories` checks the complete lockfile on dependency changes and weekly. Warnings, including unmaintained dependencies, fail the audit. The text engine now uses Skrifa; Linux window titles use FreeType/fontconfig.
 
-## Run an isolated manual session
+## Manual acceptance testing
 
-```sh
-python3 scripts/make-verification-fixtures.py /tmp/pixelferrite-fixtures
-PIXELFERRITE_CONFIG_DIR=/tmp/pixelferrite-check-config \
-PIXELFERRITE_DATA_DIR=/tmp/pixelferrite-check-data \
-cargo run --locked -p pixelferrite
-```
+Use [the manual test plan](MANUAL_TEST_PLAN.md) for a quick smoke test, detailed
+review regressions, disposable-session setup, and optional AI checks. Each case
+includes steps and an expected result using the current menu labels.
 
-Choose fresh directory names if those already contain a previous session. Use File > Open for the fixtures. No AI key is needed for checks 1–10 below. Tests for actual HTTP behavior are automated; entering a real key and pressing Send incurs the provider's normal charges.
-
-1. **Input rejection without data loss.** Paint a mark in a small document and save it. Open `oversized-canvas.ora`; expect an explanatory error and the original image still open. Open `grouped.ora`; expect an unsupported-group explanation, with no modified rendering accepted. New Image at 16,384 × 16,384 must report the pixel limit and keep the current document. The oversized fixture contains only tiny PNGs, so this check never requires creating a huge image.
-
-2. **Safe merge.** Open `merge-normal.ora`, select the white top layer and Merge Down. The picture must remain white; Undo and Redo preserve appearance. Open `merge-backdrop.ora` and try the same action. It must explain that the blend modes depend on the layers below and keep all three layers. Hidden or locked merge targets are likewise refused rather than revealed or altered.
-
-3. **Preview and external edits.** Open `white.png`, start Gaussian Blur, drag `green.png` from Finder/the file manager onto the canvas, then Cancel. The green image must arrive after cancellation and remain as its own undoable layer. Repeat with Perspective. Repeat with Apply instead of Cancel. During a preview, history restoration and AI completion must also wait; the local mock-server regressions cover those paths.
-
-4. **Stroke cancellation and redo.** Add a layer, Undo, start a brush stroke and press Escape while still holding the pointer down. Redo must still restore the added layer. Repeat starting a stroke outside the picture; the previous edit must not be undone. Closing the window during an unfinished edit must keep the window open and ask you to finish or cancel it first.
-
-5. **Alpha and editable text.** Insert `transparent-edge.png` into a larger selection, then blur through a feathered selection. Its visible fringe must stay red, with no blue/purple contamination from the transparent pixel. Add text away from the top-left, add a mask, paint on the mask, then change the text. Its logical position must stay fixed through editing, Undo/Redo, and native save/reopen.
-
-6. **Locked layers and mask Cut.** Lock a layer and try flipping, dragging it, editing its text, and changing X/Y in the inspector. Content/position remain unchanged. Unlock, select its mask and Cut a selection: the clipboard must represent mask coverage and only the selected mask pixels are erased. Paste produces a grayscale representation of that mask. Select Pixels to cut color content instead.
-
-7. **Small scaling and background work.** Create a 3 × 3 image, choose Content-Aware Scale and request 1 × 1. Both image and canvas must reach 1 × 1. With a larger photo, start a slow filter or content-aware scale. The work indicator must appear and the window remain responsive. Cancel leaves pixels/history unchanged; changing documents after cancellation must never receive the stale result. Cancellation discards results immediately; the current computation can finish in the background before another heavy operation starts.
-
-8. **Compatible export.** Create a red layer over white and hide half of it with a layer mask. Save normally, then choose File > Export Compatible ORA. Reopen both: both pictures match; the native file retains its editable mask, while the compatible copy bakes coverage into alpha and removes editable text metadata. For third-party verification, open the compatible copy in Krita/GIMP/MyPaint and compare the visible picture. Grouped imports remain explicitly unsupported.
-
-9. **Crash recovery.** In the isolated session, paint a recognizable mark, release the pointer, and wait at least 35 seconds. Force Quit only this disposable session, then relaunch using the same config/data directories. Recover must restore the mark and mark the document unsaved. Force Quit again before saving; recovery must still be offered. Finally save, close normally, relaunch, and confirm no stale recovery is offered. Repeat with Discard Recovery. A second simultaneously running window must never offer another live window's snapshot.
-
-10. **Save/discard handling.** Modify an image and close the window. Save, Discard and Cancel must be available. Cancel keeps editing; Save completes the save before closing; a cancelled save dialog or unwritable destination keeps the document open and reports failure. Discard must not leave an offer to recover that deliberately discarded image on the next launch. The automatic tests separately verify temporary-file collisions, symlinks and failures without touching your files.
-
-11. **AI settings and privacy (no Send required).** Open Settings. Changing the endpoint must clear an existing saved key. Re-entering a key authorizes the new destination; the prompt shows the actual host. History retention accepts 0. Saving 0 removes retained requests and new requests keep no files. AI Requests > Clear All erases old records and in-flight requests cannot recreate them. On Unix, inspect the isolated config/data folders: private directories are `0700` and private files are `0600`. The key is permission-protected plaintext, not a keychain secret. The automated endpoint tests use dummy keys to prove `.env` cannot redirect a saved key and redirects cannot forward uploads.
-
-12. **AI replay (optional paid manual check).** Make a small selection with feathered edges and request an edit. Duplicate the document for comparison, undo the AI layer, then restore it using AI Requests > Add Result as Layer. The restored pixels, transparency and placement must match the first insertion, including untouched pixels outside the selection. Older selected history without `result.png` must explain that exact restoration is unavailable instead of covering the context rectangle. The same assertions run automatically with a local fake answer, including responses arriving during a preview and history-off mode.
+Start with **Help > About Pixelferrite** and **Copy build info**. Compare the full
+commit to the build you were given and check **Source status: Clean** before
+recording results. The same information is available with `pixelferrite --version`.
+A build with local changes or unavailable Git metadata is explicitly labelled.
 
 ## Finding-to-test map
 

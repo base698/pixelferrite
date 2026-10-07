@@ -12,6 +12,33 @@ fn app() -> Harness<'static, App> {
     })
 }
 
+#[test]
+fn about_menu_shows_and_copies_build_identity_without_editing_document() {
+    let mut h = Harness::builder().with_size(vec2(1000.0, 700.0)).wgpu()
+        .build_eframe(|cc| App::new(cc, None));
+    h.run_steps(2);
+    let before = h.state().doc.history().1;
+    h.get_by_label("Help").click();
+    h.run_steps(2);
+    h.get_by_label("About Pixelferrite").click();
+    h.run_steps(2);
+    assert!(h.state().show_about);
+    h.get_by_label(crate::about::COMMIT);
+    h.get_by_label(crate::about::SOURCE_STATUS);
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/uitest/about-{}", std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    h.render().unwrap().save(out.join("about.png")).unwrap();
+    h.get_by_label("Copy build info").click();
+    h.step();
+    assert!(h.output().platform_output.commands.iter().any(|command|
+        matches!(command, egui::OutputCommand::CopyText(text) if text == &crate::about::build_info())));
+    assert_eq!(h.state().doc.history().1, before);
+    assert!(!h.state().doc.modified);
+    h.get_by_label("Close").click();
+    h.run_steps(2);
+    assert!(!h.state().show_about);
+}
+
 fn escape(h: &mut Harness<'_, App>) {
     h.event(Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
     h.step();

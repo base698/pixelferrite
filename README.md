@@ -189,6 +189,11 @@ cargo run --release --locked -p pixelferrite -- photo.jpg   # open a picture
 **macOS:** `./scripts/bundle-macos.sh` builds `dist/Pixelferrite.app` and puts a shortcut on the Desktop. The app is
 built for your own machine and signed ad hoc; it is not notarized for handing to others.
 
+**Build identity:** open **Help > About Pixelferrite** to see the version, full commit, source status,
+target and build profile. **Copy build info** copies these details for test reports; `pixelferrite --version`
+prints the same information. The identity is embedded at compile time. Local changes are flagged, and
+builds without Git metadata show Unknown rather than claiming a commit.
+
 **Linux:** the same commands, with the usual winit and wgpu system packages (X11 or Wayland development libraries
 and a Vulkan or GL driver), plus FreeType and fontconfig development packages for window titles. File dialogs go through the XDG desktop portal. Development so far has been on macOS, so
 expect rough edges and please report them.
@@ -229,7 +234,7 @@ The native format is [OpenRaster](https://www.openraster.org/) (`.ora`), which
 Krita, GIMP and MyPaint also open. Layer masks are stored as extra PNGs inside
 the archive that other apps ignore, and text layers carry their text, font and
 path as extra attributes so they stay editable (other apps see the rendered
-pixels). Use **File > Export Compatible ORA…** for interchange: masks are baked
+pixels). Use **File > Export Compatible OpenRaster…** for interchange: masks are baked
 into layer alpha, and editable text metadata is removed. Keep a native `.ora`
 copy when you need editable masks or text. PNG, JPEG and GIF exports flatten the image.
 
@@ -362,13 +367,14 @@ keep_history = 200  # 0 disables history and deletes retained requests
 Directories are owner-only (`0700`) and private files are `0600` on Unix.
 The key is stored in plaintext with those permissions; it is not encrypted or
 stored in the system keychain. Set history retention to **0** to disable storage,
-or use **Clear All** in AI Requests to erase it. Clearing history also prevents
+or use **Clear All History** in AI Requests to erase it. Clearing history also prevents
 requests already running from recreating deleted history.
 
 ### Verification and maintenance
 
-[The verification guide](docs/VERIFICATION.md) maps each review finding to its
-regression test and gives application-level checks. CI runs core and offscreen
+[The manual test plan](docs/MANUAL_TEST_PLAN.md) gives a quick smoke test and detailed acceptance
+checks with expected results. [The verification guide](docs/VERIFICATION.md) maps each review finding
+to its automated regression test. CI runs core and offscreen
 GUI tests on macOS and Linux, builds the macOS bundle, and checks RustSec advisories
 on dependency changes and weekly. The bounded malformed-file mutation test runs
 in the normal suite; it supplements rather than replaces continuous fuzzing.

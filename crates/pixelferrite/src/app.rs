@@ -117,6 +117,7 @@ pub struct App {
     pub ants: Ants,
     pub show_layers: bool,
     pub show_inspector: bool,
+    pub show_about: bool,
     pub toast: Option<(String, f64)>,
     pub new_doc: Option<NewDoc>,
     pub rename: Option<(LayerId, String, bool)>,
@@ -187,6 +188,7 @@ impl App {
             ants: Ants::default(),
             show_layers: true,
             show_inspector: true,
+            show_about: false,
             toast: None,
             new_doc: None,
             rename: None,
@@ -943,7 +945,7 @@ impl eframe::App for App {
         self.poll_work(&ctx);
         self.schedule_perspective();
 
-        if self.new_doc.is_none() && self.scale_dlg.is_none() && !self.ai.modal_open() {
+        if self.new_doc.is_none() && self.scale_dlg.is_none() && !self.ai.modal_open() && !self.show_about {
             self.shortcuts(&ctx);
         }
         // Switching tool or layer ends the current run of text edits.
@@ -1028,6 +1030,7 @@ impl eframe::App for App {
         self.work_status(&ctx);
         self.ai_dialogs(&ctx);
         self.recovery_dialog(&ctx);
+        crate::about::window(&ctx, &mut self.show_about);
         let stable = !self.mutation_busy();
         if let Some(recovery) = &mut self.recovery {
             if let Some(error) = recovery.poll() { self.error = Some(error); }

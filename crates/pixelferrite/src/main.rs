@@ -1,4 +1,5 @@
 mod ai;
+mod about;
 mod aiui;
 mod app;
 mod canvas;
@@ -26,7 +27,11 @@ fn main() -> eframe::Result {
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {
-                println!("usage: pixelferrite [FILE]\n\nOpens an image (.ora, .png, .jpg, .gif, .webp, ...) for editing.");
+                println!("usage: pixelferrite [FILE]\n\nOpens an image (.ora, .png, .jpg, .gif, .webp, ...) for editing.\n\n-V, --version    Print build information");
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("{}", about::build_info());
                 return Ok(());
             }
             // Older macOS versions pass a process serial number when launched from Finder.

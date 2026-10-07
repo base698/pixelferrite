@@ -149,6 +149,12 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
             item(app, ui, "Actual Size", &cmd("1"), Action::Zoom100);
             item(app, ui, "Reset Rotation", &cmd("⌥0"), Action::ResetRotation);
         });
+        ui.menu_button("Help", |ui| {
+            if ui.button("About Pixelferrite").clicked() {
+                app.show_about = true;
+                ui.close();
+            }
+        });
         ui.separator();
 
         // Zoom control.
