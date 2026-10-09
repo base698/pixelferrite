@@ -85,6 +85,11 @@ impl AiUi {
         self.prompt.is_some() || self.error.is_some() || self.settings.is_some()
     }
 
+    /// The failure of the last request, for a caller that will report it itself.
+    pub fn take_error(&mut self) -> Option<String> {
+        self.error.take()
+    }
+
     /// Lets the README screenshots show a neutral key location.
     #[cfg(test)]
     pub fn set_key_source(&mut self, source: &str) {
@@ -98,7 +103,6 @@ impl AiUi {
         self.prompt.is_some()
     }
 
-    #[cfg(test)]
     pub fn running(&self) -> bool {
         self.run.is_some()
     }
@@ -654,6 +658,8 @@ impl App {
                 ui.end_row();
             });
             ui.add_space(6.0);
+            ui.checkbox(&mut d.edit.bridge.enabled, "Allow local MCP clients to control this app")
+                .on_hover_text("Lets programs running as you, such as Claude Code through `pixelferrite mcp`, edit the open document. Takes effect after restarting Pixelferrite.");
             ui.label(RichText::new("Set Keep to 0 to disable history and erase saved requests. Changing the API URL clears the old key; enter the key for the new destination.").small().weak());
             let live = ai::Config::load(&d.edit.ai);
             let note = match &live.key {

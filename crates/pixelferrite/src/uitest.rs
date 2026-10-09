@@ -492,3 +492,74 @@ fn smart_select_filters_and_geometry() {
     assert!(h.state_mut().doc.content_aware_scale(700, 600));
     assert_eq!(h.state().doc.state.width, 700);
 }
+
+#[test]
+fn outside_commands_drive_the_open_document() {
+    use serde_json::json;
+    let mut h = Harness::builder().with_size(vec2(1400.0, 880.0)).wgpu().build_eframe(|cc| App::new(cc, None));
+    h.run_steps(3);
+    let c = h.state().view.vp.center();
+    let ctx = h.ctx.clone();
+
+    // Commands edit the document in the window, each as an undo step.
+    let out = h.state_mut().execute(&json!({"op": "batch", "commands": [
+        {"op": "add_layer", "name": "From outside"},
+        {"op": "select_ellipse", "rect": [400, 300, 800, 700]},
+        {"op": "fill", "color": "#c02030"},
+        {"op": "deselect"},
+        {"op": "add_text", "text": "driven over MCP", "x": 380, "y": 860, "size": 90},
+    ]})).unwrap();
+    assert_eq!(out.as_array().unwrap().len(), 5);
+    h.run_steps(3);
+    assert_eq!(pf_core::composite::sample(&h.state().doc.state, 600, 500), Some([192, 32, 48, 255]));
+    let (names, _) = h.state().doc.history();
+    assert_eq!(names.collect::<Vec<_>>(), ["New Layer", "Elliptical Selection", "Fill", "Deselect", "Add Text"]);
+    let info = h.state_mut().execute(&json!({"op": "get_document_info"})).unwrap();
+    assert_eq!(info["layers_bottom_first"].as_array().unwrap().len(), 3);
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/uitest");
+    std::fs::create_dir_all(&out).unwrap();
+    h.render().unwrap().save(out.join("mcp.png")).unwrap();
+    h.state_mut().run(&ctx, Action::Undo);
+    assert!(h.state().doc.state.layers.iter().all(|l| l.text.is_none()), "the user can undo what a command did");
+
+    // Unsaved work is not thrown away unless the command says so.
+    let refused = h.state_mut().execute(&json!({"op": "new", "width": 320, "height": 200})).unwrap_err();
+    assert!(refused.contains("unsaved changes"), "{refused}");
+    assert_eq!(h.state().doc.state.width, 1600);
+
+    // While a dialog owns the image, edits wait but looking still works.
+    h.state_mut().run(&ctx, Action::GaussianBlur);
+    h.run_steps(2);
+    assert!(h.state().filter.is_some());
+    let busy = h.state_mut().execute(&json!({"op": "fill", "color": "#000000"})).unwrap_err();
+    assert!(busy.contains("in the middle of something"), "{busy}");
+    assert!(h.state_mut().execute(&json!({"op": "get_canvas_screenshot", "max_size": 64})).unwrap()["png_base64"].is_string());
+    h.event(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    assert!(h.state().filter.is_none());
+
+    // A drag in progress is protected the same way.
+    h.state_mut().tool = Tool::Brush;
+    h.hover_at(c);
+    h.step();
+    button(&h, c, true);
+    h.step();
+    h.hover_at(c + vec2(30.0, 0.0));
+    h.step();
+    assert!(h.state_mut().execute(&json!({"op": "clear"})).is_err());
+    button(&h, c + vec2(30.0, 0.0), false);
+    h.step();
+
+    // Replacing the document resets the window's state for it.
+    let fresh = h.state_mut().execute(&json!({"op": "new", "width": 320, "height": 200, "background": "#204060", "discard_unsaved": true})).unwrap();
+    assert_eq!((fresh["width"].as_u64(), fresh["unsaved_changes"].as_bool()), (Some(320), Some(false)));
+    h.run_steps(3);
+    assert_eq!(pf_core::composite::sample(&h.state().doc.state, 10, 10), Some([32, 64, 96, 255]));
+
+    // An AI edit without a key fails with what to do about it, and leaves no dialog behind.
+    if crate::ai::Config::load(&h.state().saved.ai).key.is_none() {
+        let e = h.state_mut().execute(&json!({"op": "ai_edit", "prompt": "add a boat"})).unwrap_err();
+        assert!(e.contains("OpenAI key"), "{e}");
+    }
+    assert_eq!(h.state_mut().execute(&json!({"op": "ai_status"})).unwrap()["running"], false);
+}

@@ -151,6 +151,9 @@ pub struct App {
     recoveries: Vec<Candidate>,
     recovered_source: Option<Candidate>,
     pub(crate) work: Option<crate::jobs::Work>,
+    /// The private socket `pixelferrite mcp` drives this window through.
+    pub bridge: Option<crate::bridge::Bridge>,
+    pub api_scratch: pf_core::api::Scratch,
 }
 
 impl App {
@@ -217,7 +220,12 @@ impl App {
             recoveries,
             recovered_source: None,
             work: None,
+            bridge: None,
+            api_scratch: Default::default(),
         };
+        if !cfg!(test) && app.saved.bridge.enabled {
+            app.bridge = crate::bridge::Bridge::start(app.saved.bridge.port, cc.egui_ctx.clone());
+        }
         if let Some(e) = settings_error {
             app.toast(format!("Couldn't read settings, using defaults. {e}"));
         }
@@ -262,6 +270,24 @@ impl App {
         self.scale_dlg = None;
         self.regions = None;
         self.ai.document_changed();
+    }
+
+    /// Swap in a document made by an outside command, as File > New or Open would.
+    pub(crate) fn replace_document(&mut self, doc: Document, opened: Option<&Path>) {
+        self.set_doc(doc);
+        if let Some(path) = opened {
+            self.opened = Some(path.to_owned());
+            self.store.add_recent(path);
+        }
+    }
+
+    /// Bookkeeping after an outside command saved the document.
+    pub(crate) fn saved_to_file(&mut self) {
+        if let Some(path) = self.doc.path.clone() {
+            self.store.add_recent(&path);
+        }
+        if let Some(recovery) = &mut self.recovery { recovery.clear(); }
+        if let Some(old) = self.recovered_source.take() { old.discard(); }
     }
 
     /// Re-render a text layer from `spec`. Edits made in a row to the same
@@ -944,6 +970,7 @@ impl eframe::App for App {
         self.now = ctx.input(|i| i.time);
         self.poll_work(&ctx);
         self.schedule_perspective();
+        self.serve_bridge();
 
         if self.new_doc.is_none() && self.scale_dlg.is_none() && !self.ai.modal_open() && !self.show_about {
             self.shortcuts(&ctx);

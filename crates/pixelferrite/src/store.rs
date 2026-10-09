@@ -27,6 +27,25 @@ const RECENT_MAX: usize = 15;
 #[serde(default)]
 pub struct Settings {
     pub ai: AiSettings,
+    pub bridge: BridgeSettings,
+}
+
+/// Local control of the running app by `pixelferrite mcp`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BridgeSettings {
+    /// Allow programs running as this user to drive the open window.
+    pub enabled: bool,
+    /// Names the private socket; no network port is opened.
+    pub port: u16,
+}
+
+pub const DEFAULT_BRIDGE_PORT: u16 = 47822;
+
+impl Default for BridgeSettings {
+    fn default() -> Self {
+        Self { enabled: true, port: DEFAULT_BRIDGE_PORT }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

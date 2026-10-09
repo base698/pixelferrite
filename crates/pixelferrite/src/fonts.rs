@@ -69,3 +69,13 @@ impl Fonts {
         face
     }
 }
+
+impl pf_core::api::Host for Fonts {
+    fn font(&mut self, family: &str, bold: bool, italic: bool) -> Face {
+        self.face(family, bold, italic)
+    }
+
+    fn font_families(&mut self) -> Vec<String> {
+        self.families().to_vec()
+    }
+}

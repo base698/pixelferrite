@@ -2490,10 +2490,12 @@ name = "pf-core"
 version = "0.1.0"
 dependencies = [
  "ab_glyph_rasterizer",
+ "base64",
  "epaint_default_fonts",
  "image",
  "rayon",
  "roxmltree 0.21.1",
+ "serde_json",
  "skrifa",
  "thiserror 2.0.21",
  "zip",
@@ -2590,6 +2592,7 @@ dependencies = [
  "egui_kittest",
  "epaint_default_fonts",
  "fontdb",
+ "libc",
  "pf-core",
  "rfd",
  "serde",

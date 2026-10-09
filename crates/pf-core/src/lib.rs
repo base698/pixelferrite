@@ -2,6 +2,7 @@
 //! This crate has no GUI dependencies so everything here is testable headless.
 
 pub mod aiedit;
+pub mod api;
 pub mod blend;
 pub mod buf;
 pub mod composite;

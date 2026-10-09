@@ -30,6 +30,7 @@
   <a href="#paint-with-a-prompt">AI painting</a> ·
   <a href="#select-what-you-mean">Selections</a> ·
   <a href="#type-filters-and-geometry">Type &amp; filters</a> ·
+  <a href="#built-for-agents">Agents</a> ·
   <a href="#everything-in-the-box">Everything in the box</a> ·
   <a href="#get-started">Get started</a> ·
   <a href="#under-the-hood">Under the hood</a> ·
@@ -159,6 +160,24 @@ is uploaded to the destination shown in the prompt dialog; nothing is sent until
   </tr>
 </table>
 
+## Built for agents
+
+`pixelferrite mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server. Point Claude Code or any
+other MCP client at it and say what you want: "remove the red eye in this photo", "cut out the dog and put it on the
+beach layer", "set the title along the top of the arch". The agent looks at the picture, zooms in on the part it
+cares about, runs editor commands and checks its own work with another screenshot.
+
+If a Pixelferrite window is open, the agent edits **that document, live**: you watch the selection appear and the
+pixels change, every command is an ordinary undo step, and ⌘Z takes back anything you don't like. With no window
+open it works headless on files.
+
+```sh
+claude mcp add pixelferrite -- /path/to/pixelferrite mcp
+```
+
+For the Mac app that path is `dist/Pixelferrite.app/Contents/MacOS/pixelferrite`. The buttons in the window and the
+commands an agent sends run the same engine code. See [MCP](#mcp) for the tools and the security model.
+
 ## Everything in the box
 
 | | |
@@ -169,6 +188,7 @@ is uploaded to the destination shown in the prompt dialog; nothing is sent until
 | **Type** | Straight or along a path, system fonts, editable after saving |
 | **Filters** | Gaussian and surface blur, sharpen, heal, reduce noise, auto contrast, equalize, local contrast, threshold, match colours, perspective, lens distortion, content-aware scale, edge detection |
 | **AI** | Edit a selection, restyle a whole image, extend past the edges; request history |
+| **Agents** | MCP server that drives the open window or works headless on files; every edit an undo step |
 | **Canvas** | Pinch to zoom, two-finger rotate, a zoom slider in the toolbar |
 | **Files** | OpenRaster `.ora` documents; opens and inserts PNG, JPEG, GIF, WebP and more; exports PNG, JPEG, GIF |
 
@@ -330,6 +350,35 @@ OPENAI_IMAGE_QUALITY=medium
 `.env` is git-ignored. `cargo test -p pixelferrite -- --ignored live` sends three
 small real requests to check the key and model.
 
+### MCP
+
+`pixelferrite mcp` speaks MCP on stdin/stdout:
+
+| Tool | |
+|---|---|
+| `get_reference` | the full command list with arguments |
+| `get_document_info` | canvas size, layers, the active layer, the selection, recent history |
+| `get_layer_info` | one layer: its frame, what is actually painted on it, mask, text settings |
+| `get_canvas_screenshot` | the image, or a zoomed region of it, with the selection shown |
+| `execute_pixelferrite_commands` | a list of JSON commands, each one an undo step |
+| `ai_edit` | a prompt sent to OpenAI with the selection, as in the app; a paid request |
+
+The commands cover documents and files, layers and masks, every selection tool, painting, gradients, filters,
+colour adjustment, red-eye, text (straight or on a path) and perspective. They are documented in
+`crates/pf-core/src/api.rs` (`REFERENCE`), which is also what `get_reference` tells the client. A command that
+would change the image is refused while a dialog, drag or preview is open in the window; looking always works.
+
+On macOS and Linux the server drives the running window over a private Unix socket in a mode-0700 `bridge`
+directory beside the settings. There is no TCP listener. Any program running as your OS user can connect, and
+through it can change the open document and read and write image files with your permissions. Turn this off in
+File > Settings ("Allow local MCP clients") or with `[bridge] enabled = false`, then restart the app.
+
+If no window is open when the first command runs, or with `--headless`, the server works on a document of its own
+and reads and writes files with `open`, `save` and `export`. That choice lasts for the whole MCP session: losing
+the connection returns an error instead of switching documents or replaying a command, and a restarted app has a
+new identity, so restart the MCP client to pick it up. `--port N` selects a different socket name (default 47822).
+Headless AI edits are not written to the AI request history.
+
 ### Inserting images
 
 File > "Insert Image as New Layer…" adds an image centred on the canvas (so
@@ -361,6 +410,10 @@ model = ""          # empty = gpt-image-2
 quality = ""        # low | medium | high, empty = automatic
 base_url = ""       # empty = OpenAI
 keep_history = 200  # 0 disables history and deletes retained requests
+
+[bridge]
+enabled = true      # let `pixelferrite mcp` drive the open window; restart after changing
+port = 47822        # names the private socket, not a network port
 ```
 
 `PIXELFERRITE_CONFIG_DIR` and `PIXELFERRITE_DATA_DIR` move the two folders.
