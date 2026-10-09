@@ -1,6 +1,6 @@
 [package]
 name = "pixelferrite"
-version = "0.1.0"
+version = "0.2.0-dev"
 edition = "2024"
 rust-version = "1.98"
 
@@ -11,7 +11,7 @@ egui = "0.36.2"
 egui-phosphor = "0.14.0"
 epaint_default_fonts = "0.36.2"
 fontdb = "0.24.0"
-pf-core = { version = "0.1.0", path = "../pf-core" }
+pf-core = { version = "0.2.0-dev", path = "../pf-core" }
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
